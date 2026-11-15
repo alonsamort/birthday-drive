@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>18:52 — день рождения</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --burgundy: #5b1f27;
+    --cream: #e6e2d8;
+    --char: #26262a;
+    --lamp: #ffd9a0;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #0a0708;
+    color: var(--cream);
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+  }
+  #view {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+  }
+  #view canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #241116;
+  }
+  /* ---- CRT overlay ---- */
+  #crt, #vignette, #hud {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+  }
+  #crt {
+    z-index: 3;
+    background-image: repeating-linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.28) 0px,
+      rgba(0, 0, 0, 0.28) 1px,
+      rgba(0, 0, 0, 0) 1px,
+      rgba(0, 0, 0, 0) 3px
+    );
+    opacity: 0.9;
+  }
+  #vignette {
+    z-index: 4;
+    background:
+      radial-gradient(ellipse at 50% 50%, rgba(0,0,0,0) 45%, rgba(0,0,0,0.34) 100%),
+      linear-gradient(to bottom, rgba(91,31,39,0.12), rgba(0,0,0,0.10) 60%, rgba(0,0,0,0.28));
+  }
+  #hud {
+    z-index: 5;
+    font-size: clamp(10px, 2.1vmin, 20px);
+    letter-spacing: 0.06em;
+    text-shadow: 0 2px 0 rgba(0,0,0,0.85), 0 0 12px rgba(0,0,0,0.55);
+  }
+  #clockbox {
+    position: absolute;
+    left: 3.2vmin;
+    bottom: 3vmin;
+    line-height: 1;
+  }
+  #clocklabel {
+    font-size: 0.72em;
+    opacity: 0.62;
+    letter-spacing: 0.22em;
+    margin-bottom: 0.45em;
+  }
+  #clock {
+    font-size: 2.55em;
+    letter-spacing: 0.05em;
+    font-weight: 700;
+    color: #fff;
+  }
+  #clock.late { color: #ff8f8f; }
+  #mood {
+    position: absolute;
+    left: 3.2vmin;
+    top: 3vmin;
+    font-size: 0.95em;
+    opacity: 0.9;
+  }
+  #moodbar {
+    margin-top: 0.5em;
+    width: 13vmin;
+    height: 0.7vmin;
+    min-height: 4px;
+    background: rgba(230, 226, 216, 0.18);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.5);
+  }
+  #moodfill {
+    height: 100%;
+    width: 100%;
+    background: var(--cream);
+    transition: width 0.25s ease-out;
+  }
+  #caption {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 16.5vmin;
+    width: min(84vw, 720px);
+    text-align: center;
+    font-size: 1.12em;
+    line-height: 1.45;
+    color: #fff;
+    opacity: 0;
+    transition: opacity 0.22s linear;
+    white-space: pre-line;
+  }
+  #caption.on { opacity: 1; }
+  #sub.on { opacity: 0.7; }
+  #sub {
+    opacity: 0;
+    transition: opacity 0.22s linear;
+    position: absolute;
+    left: 3.2vmin;
+    bottom: 13.5vmin;
+    font-size: 0.82em;
+    text-align: left;
+    max-width: 40vw;
+  }
+  #invert {
+    position: absolute;
+    right: 3.2vmin;
+    top: 3vmin;
+    font-size: 0.95em;
+    color: #ffb8b8;
+    opacity: 0;
+    transition: opacity 0.15s linear;
+    text-align: right;
+    border: 1px solid rgba(255,184,184,0.5);
+    padding: 0.6em 0.8em;
+    background: rgba(91,31,39,0.45);
+  }
+  #invert.on { opacity: 1; }
+  #seg {
+    position: absolute;
+    right: 3.2vmin;
+    bottom: 3vmin;
+    font-size: 0.78em;
+    opacity: 0.5;
+    letter-spacing: 0.18em;
+  }
+  #speed {
+    position: absolute;
+    right: 3.2vmin;
+    bottom: 7.4vmin;
+    font-size: 0.78em;
+    letter-spacing: 0.12em;
+    opacity: 0.78;
+    color: var(--lamp);
+    text-align: right;
+  }
+  #speed .unit { opacity: 0.6; }
+  #turn, #warn {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 0.35em 0.9em;
+    border: 1px solid rgba(230,226,216,0.45);
+    background: rgba(91,31,39,0.55);
+    letter-spacing: 0.22em;
+    font-size: 0.8em;
+    opacity: 0;
+    transition: opacity 0.12s linear;
+  }
+  #turn { top: 3vmin; color: var(--lamp); }
+  #warn { top: 7.6vmin; color: #fff; }
+  #turn.on { opacity: 1; }
+  #warn.on {
+    opacity: 1;
+    animation: warnblink 0.42s steps(2, end) infinite;
+  }
+  @keyframes warnblink {
+    0%, 49% { background: rgba(150, 30, 40, 0.85); color: #fff; }
+    50%, 100% { background: rgba(20, 8, 10, 0.5); color: #ffd0d0; }
+  }
+  /* ---- screens ---- */
+  .screen {
+    position: fixed;
+    inset: 0;
+    z-index: 8;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 6vmin;
+    box-sizing: border-box;
+    background:
+      linear-gradient(rgba(20,8,10,0.80), rgba(20,8,10,0.90)),
+      repeating-linear-gradient(to bottom, rgba(91,31,39,0.10) 0 2px, rgba(0,0,0,0) 2px 4px);
+    -webkit-backdrop-filter: blur(1px);
+    backdrop-filter: blur(1px);
+  }
+  .screen.hidden { display: none; }
+  /* победа: финальный кадр должен быть виден */
+  #won {
+    background: linear-gradient(
+      to bottom,
+      rgba(16,6,8,0.80) 0%,
+      rgba(16,6,8,0.10) 30%,
+      rgba(16,6,8,0) 45%,
+      rgba(16,6,8,0.25) 72%,
+      rgba(16,6,8,0.80) 100%
+    );
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    justify-content: space-between;
+    padding: 4.5vmin 6vmin 3.5vmin;
+    pointer-events: none;
+  }
+  #won h1 { margin-bottom: 0.25em; text-shadow: 0 3px 0 rgba(0,0,0,0.9); }
+  #won h2 { margin-bottom: 0.2em; text-shadow: 0 2px 0 rgba(0,0,0,0.9); }
+  #won p {
+    max-width: 52em;
+    font-size: clamp(12px, 2.05vmin, 18px);
+    color: #fff;
+    opacity: 0.95;
+    text-shadow: 0 2px 0 rgba(0,0,0,0.9);
+  }
+  #won button { pointer-events: auto; }
+  #won .wontop {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2.2vmin 3.4vmin;
+    background: rgba(18,7,9,0.55);
+    border: 1px solid rgba(230,226,216,0.14);
+  }
+  .screen h1 {
+    font-size: clamp(20px, 4.6vmin, 44px);
+    margin: 0 0 0.35em;
+    letter-spacing: 0.12em;
+    font-weight: 700;
+    color: #fff;
+  }
+  .screen h2 {
+    font-size: clamp(15px, 2.9vmin, 28px);
+    margin: 0 0 0.9em;
+    letter-spacing: 0.06em;
+    font-weight: 400;
+    color: #ffd9a0;
+  }
+  .screen p {
+    max-width: 46em;
+    font-size: clamp(11px, 1.9vmin, 17px);
+    line-height: 1.65;
+    margin: 0.25em 0;
+    color: #e6e2d8;
+    opacity: 0.88;
+  }
+  .screen .keys {
+    margin-top: 1.6em;
+    font-size: clamp(10px, 1.7vmin, 15px);
+    opacity: 0.72;
+    letter-spacing: 0.08em;
+    line-height: 1.9;
+  }
+  .screen .keys b {
+    color: #ffd9a0;
+    font-weight: 700;
+  }
+  button {
+    margin-top: 2.2em;
+    font: inherit;
+    font-size: clamp(12px, 2vmin, 19px);
+    letter-spacing: 0.12em;
+    padding: 0.85em 2.1em;
+    color: #2a1216;
+    background: var(--cream);
+    border: 2px solid #2a1216;
+    box-shadow: 4px 4px 0 rgba(0,0,0,0.55);
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  button:hover { background: #fff; }
+  button:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 rgba(0,0,0,0.55); }
+  .tiny { font-size: clamp(9px, 1.4vmin, 12px); opacity: 0.5; margin-top: 2.4em; letter-spacing: 0.16em; }
+  #err {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 20;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #ffd0d0;
+    background: rgba(120, 20, 30, 0.92);
+    display: none;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+
+<div id="view"></div>
+
+<div id="crt"></div>
+<div id="vignette"></div>
+
+<div id="hud">
+  <div id="mood">
+    <div>Настроение <span id="moodpct">100%</span></div>
+    <div id="moodbar"><div id="moodfill"></div></div>
+  </div>
+  <div id="invert">ГОЛУБЬ В САЛОНЕ<br><span id="inverts">5.0</span> · всё наоборот</div>
+  <div id="clockbox">
+    <div id="clocklabel">ВРЕМЯ</div>
+    <div id="clock">18:52</div>
+  </div>
+  <div id="caption"></div>
+  <div id="sub"></div>
+  <div id="seg"></div>
+  <div id="speed"><span id="speedval">0</span> <span class="unit">ед/с</span></div>
+  <div id="turn">ПОВОРОТ →</div>
+  <div id="warn">ПЕРЕКРЁСТОК</div>
+</div>
+
+<div id="start" class="screen">
+  <h1>18:52 · ДЕНЬ РОЖДЕНИЯ</h1>
+  <h2>ты выехал позже, чем хотел</h2>
+  <p>Впереди двор, шоссе и город. Сзади — полиция.<br>Сзади-сзади — ещё что-то.</p>
+  <p>Успей к 19:00. Всё, что случится, столкновения не отменяет.</p>
+  <div class="keys">
+    <b>← →</b> / <b>A D</b> — руль (держать) &nbsp;·&nbsp; <b>↓</b> / <b>S</b> — тормоз<br>
+    на телефоне: тап по левой половине — влево, по правой — вправо (тап — рывок, удержание — руль)<br>
+    два пальца — тормоз<br><br>
+    <b>ПРОБЕЛ</b> или клик — поехали
+  </div>
+  <div class="tiny" id="loading">загружаем три.js</div>
+</div>
+
+<div id="over" class="screen hidden">
+  <h1 id="overtitle">19:00</h1>
+  <h2 id="oversub">приехали без тебя</h2>
+  <p id="overtext"></p>
+  <button id="retry">с начала отрезка</button>
+</div>
+
+<div id="won" class="screen hidden">
+  <div class="wontop">
+    <h1 id="wontitle">они ехали поздравить</h1>
+    <h2 id="wonsub">торт был у них</h2>
+    <p id="wontext"></p>
+  </div>
+  <button id="again">ещё раз</button>
+</div>
+
+<div id="err"></div>
+
+<script>
+  // если модуль не загрузился (нет вендорного three.js, старый браузер) — сказать об этом
+  window.addEventListener('error', function (e) {
+    var box = document.getElementById('err');
+    if (!box) return;
+    box.style.display = 'block';
+    box.textContent = 'Не запустилось: ' + (e.message || e.type) +
+      '\nНужен локальный сервер: python3 -m http.server в папке игры.';
+  });
+</script>
+<script type="module" src="./game.js"></script>
+</body>
+</html>
