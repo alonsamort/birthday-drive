@@ -18,6 +18,10 @@ const HIT_CLOCK = 30;          // штраф за столкновение
 const ROUTE = 18500;           // ~6.7 минут при полном ходу
 const MOOD_WIN = 50;           // меньше — финал-провал, даже если доехал
 const STEER_ACC = 20;          // боковое ускорение руля, ед/с²
+const POLICE_TRAIL = 5.6;      // патрульная машина держится позади игрока
+const POLICE_FOLLOW = 18;      // насколько жёстко она держит дистанцию
+const SHOULDER_EDGE = 4.35;    // |lat| больше — машина на обочине
+const SHOULDER_MAX_SPEED = 30; // потолок скорости на обочине, ед/с
 
 const SEGMENTS = [
   { name: 'ДВОР', start: 0, end: 5850 },
@@ -168,7 +172,7 @@ function applyCameraFraming() {
   const aspect = vw / vh;
   const close = IS_COARSE() || aspect < 1.2;
   VIEW_SPAN = close ? CLOSE_VIEW_SPAN : BASE_VIEW_SPAN;
-  CAM_LOOKAHEAD = close ? 26 : 21;
+  CAM_LOOKAHEAD = close ? 17.5 : 19;
   const spanW = VIEW_SPAN * (VIEW_W / VIEW_H);
   camera.left = -spanW / 2;
   camera.right = spanW / 2;
@@ -1572,6 +1576,7 @@ const S = {
   warnT: 0,
   turnT: 0,
   kerbT: -9,
+  moodDrain: null,
   capQueue: [],
   capTimer: 0,
   finaleT: 0,
@@ -2017,6 +2022,7 @@ function hit(kind, sec = HIT_CLOCK, moodLoss = 12) {
   S.speed = Math.min(S.speed, SPEED_MAX * 0.42);
   S.clock += sec;
   S.mood = Math.max(0, S.mood - moodLoss);
+  S.moodDrain = { src: `hit:${kind}`, value: moodLoss, at: S.time, until: S.time + 2 };
   S.hitKinds[kind] = (S.hitKinds[kind] || 0) + 1;
   const captions = {
     cow: 'Корова. Она тут живёт.\nНастроение −12% · −30 секунд',
@@ -2177,14 +2183,13 @@ function updatePlay(dt) {
 
   if (S.slip > 0) S.slip -= dt;
 
-  /* обочина: тряска, потеря хода, настроение — не смерть */
-  if (Math.abs(S.lat) > 4.35) {
-    S.speed = Math.min(S.speed, 26);
+  /* обочина: тряска и потолок скорости, но настроение не трогаем */
+  if (Math.abs(S.lat) > SHOULDER_EDGE) {
+    S.speed = Math.min(S.speed, SHOULDER_MAX_SPEED);
     S.shake = Math.max(S.shake, 0.24);
-    S.mood = Math.max(0, S.mood - 2.2 * dt);
     if (t - S.kerbT > 3.5) {
       S.kerbT = t;
-      say('ОБОЧИНА. Держись дороги.', 2);
+      say('ОБОЧИНА. Тут медленно и трясёт.', 2);
     }
   }
 
@@ -2214,8 +2219,8 @@ function updatePlay(dt) {
   playerBody.rotation.z = clamp(-S.latV * 0.012, -0.11, 0.11);
 
   /* --- полиция --- */
-  police.position.x = damp(police.position.x, S.x * 0.92, 3.5, dt);
-  police.position.z = damp(police.position.z, -S.p + 8.8, 4.5, dt);
+  police.position.x = damp(police.position.x, S.x * 0.94, 6, dt);
+  police.position.z = damp(police.position.z, -S.p + POLICE_TRAIL, POLICE_FOLLOW, dt);
 
   /* --- жених: едет рядом в кадре, толкает в бок и сигналит --- */
   if (groom.visible) {
@@ -2379,6 +2384,7 @@ function updateSegmentObjects(dt) {
       f.paid = true;
       S.clock += HIT_CLOCK;
       S.mood = Math.max(0, S.mood - 6);
+      S.moodDrain = { src: 'funeral', value: 6, at: S.time, until: S.time + 2 };
       say('Похороны. Не дал пройти спокойно.\n−30 секунд', 3.6, true);
       for (const m of f.mourners) {
         m.obj.position.x = damp(m.obj.position.x, m.dir * 8.2, 1.8, dt);
@@ -2504,7 +2510,7 @@ function updateFinale(dt) {
   // полиция обгоняет и перекрывает въезд
   const k = clamp(t / 1.6, 0, 1);
   const ease = k * k * (3 - 2 * k);
-  police.position.z = THREE.MathUtils.lerp(-ROUTE + 8.8, -(ROUTE + 2.5), ease);
+  police.position.z = THREE.MathUtils.lerp(-ROUTE + POLICE_TRAIL, -(ROUTE + 2.5), ease);
   police.position.x = THREE.MathUtils.lerp(S.x * 0.92, roadOff(ROUTE) - 1.5, ease);
   police.rotation.y = THREE.MathUtils.lerp(0, 0.38, ease);
 
@@ -2659,7 +2665,7 @@ function startRun(fromStart) {
   S.time = 0;
   resetPlayer();
   buildSegment(S.seg);
-  police.position.set(S.x * 0.9, 0, -S.p + 8.8);
+  police.position.set(S.x * 0.94, 0, -S.p + POLICE_TRAIL);
   police.rotation.y = 0;
   camLook.set(S.x * 0.9, 1, -S.p - CAM_LOOKAHEAD);
   camYawNow = CAM_YAW + roadHead(S.p) * 0.8;
@@ -2693,7 +2699,7 @@ function retrySegment() {
   camera.updateProjectionMatrix();
   resetPlayer();
   buildSegment(S.seg);
-  police.position.set(S.x * 0.9, 0, -S.p + 8.8);
+  police.position.set(S.x * 0.94, 0, -S.p + POLICE_TRAIL);
   camLook.set(S.x * 0.9, 1, -S.p - CAM_LOOKAHEAD);
   camYawNow = CAM_YAW + roadHead(S.p) * 0.8;
   S.capQueue.length = 0;
@@ -2942,6 +2948,16 @@ window.__game = {
       },
       lat: +S.lat.toFixed(2),
       latV: +S.latV.toFixed(2),
+      onShoulder: Math.abs(S.lat) > SHOULDER_EDGE,
+      shoulderEdge: SHOULDER_EDGE,
+      moodDrain: S.moodDrain && S.time < S.moodDrain.until
+        ? { src: S.moodDrain.src, value: S.moodDrain.value, at: +S.moodDrain.at.toFixed(2) }
+        : null,
+      policeView: {
+        onScreen: window.__game.onScreen(police.position.x, police.position.y + 0.9, police.position.z),
+        center: window.__game.project(police.position.x, police.position.y + 0.9, police.position.z),
+        top: window.__game.project(police.position.x, police.position.y + 1.65, police.position.z),
+      },
       speed: +S.speed.toFixed(1),
       roadOffset: +roadOff(S.p).toFixed(2),
       curvature: +roadCurv(S.p).toFixed(5),
