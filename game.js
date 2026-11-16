@@ -1633,21 +1633,69 @@ const audio = (() => {
   let sirenUntil = 0;
   let timer = null;
 
+  // состояние разблокировки: диагностика и честный индикатор
+  let contextCount = 0;
+  let unlockAttempts = 0;
+  let stateBeforeGesture = 'idle';
+  let stateAfterGesture = 'idle';
+  let lastError = '';
+  let gestureSource = 'none';
+  let lastPointerAt = -1e9;
+  let zeroBuf = null;
+  let sessionEl = null;
+  let silentUri = null;
+  let startedAt = 0;
+  let silentFor = 0;
+  let lastTickAt = 0;
+  let lastRmsAt = 0;
+  let hintText = null;
+  let hintOn = false;
+  let hintBad = false;
+  let hintStart = null;
+  let hintEl = null;
+
   const hash = (n) => {
     const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
     return x - Math.floor(x);
   };
 
+  function errText(e) {
+    return String((e && (e.message || e.name)) || e || 'unknown');
+  }
+
+  function setPlaybackSession() {
+    const s = navigator.audioSession;
+    if (!s) return;
+    try {
+      // iOS: playback игнорирует бесшумный переключатель, ambient — нет
+      if (s.type !== 'playback') s.type = 'playback';
+    } catch (e) {
+      lastError = 'audioSession: ' + errText(e);
+    }
+  }
+
+  function sessionType() {
+    const s = navigator.audioSession;
+    return s ? String(s.type) : 'none';
+  }
+
   function ensure() {
     if (ctx) return ctx;
     const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return null;
-    try {
-      ctx = new AC();
-    } catch (_) {
-      ctx = null;
+    if (!AC) {
+      lastError = 'WebAudio недоступен';
       return null;
     }
+    setPlaybackSession();
+    try {
+      ctx = new AC();
+    } catch (e) {
+      ctx = null;
+      lastError = 'AudioContext: ' + errText(e);
+      return null;
+    }
+    contextCount++;
+    resumeSync();                 // не ждём сборки графа: жест ещё активен
     comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -14;
     comp.knee.value = 8;
@@ -1661,7 +1709,9 @@ const audio = (() => {
     buf = new Float32Array(analyser.fftSize);
 
     master = ctx.createGain();
-    master.gain.value = muted ? 0 : MASTER_LEVEL;
+    // контекст можно создать первым касанием на стартовом экране:
+    // до start() мастер молчит, чтобы пад не играл под заголовком
+    master.gain.value = (muted || !started) ? 0 : MASTER_LEVEL;
     music = ctx.createGain();
     music.gain.value = MUSIC_LEVEL;
     sfx = ctx.createGain();
@@ -1710,23 +1760,150 @@ const audio = (() => {
     return ctx;
   }
 
-  function resumeIfNeeded() {
-    if (started && ctx && ctx.state === 'suspended') {
-      const p = ctx.resume();
-      if (p && p.catch) p.catch(() => {});
+  function resumeSync() {
+    if (!ctx || ctx.state === 'running') return null;
+    let p = null;
+    try {
+      // строго синхронно внутри обработчика жеста: без await до этой строки
+      p = ctx.resume();
+    } catch (e) {
+      lastError = 'resume: ' + errText(e);
+      return null;
+    }
+    if (p && p.then) {
+      p.then(
+        () => { lastError = ''; stateAfterGesture = ctx ? ctx.state : 'idle'; updateHint(); },
+        (e) => { lastError = 'resume: ' + errText(e); stateAfterGesture = ctx ? ctx.state : 'idle'; updateHint(); }
+      );
+    }
+    return p;
+  }
+
+  function primeOutput() {
+    if (!ctx) return;
+    try {
+      if (!zeroBuf || zeroBuf.sampleRate !== ctx.sampleRate) {
+        zeroBuf = ctx.createBuffer(1, Math.max(32, Math.floor(ctx.sampleRate * 0.03)), ctx.sampleRate);
+      }
+      // стандартная разблокировка: проиграть буфер из нулей на running-контексте
+      const src = ctx.createBufferSource();
+      src.buffer = zeroBuf;
+      src.connect(ctx.destination);
+      src.onended = dispose([src]);
+      src.start(0);
+    } catch (e) {
+      lastError = 'unlock buffer: ' + errText(e);
     }
   }
 
+  function silentWavUri() {
+    if (silentUri) return silentUri;
+    const rate = 8000;
+    const dataLen = Math.floor(rate * 0.2);      // 0.2 с тишины
+    const bytes = new Uint8Array(44 + dataLen);
+    const v = new DataView(bytes.buffer);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) bytes[o + i] = s.charCodeAt(i); };
+    str(0, 'RIFF');
+    v.setUint32(4, 36 + dataLen, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true);
+    v.setUint32(28, rate, true);
+    v.setUint16(32, 1, true);
+    v.setUint16(34, 8, true);
+    str(36, 'data');
+    v.setUint32(40, dataLen, true);
+    bytes.fill(128, 44);                          // 8-bit PCM: 128 = тишина
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    silentUri = 'data:audio/wav;base64,' + btoa(bin);
+    return silentUri;
+  }
+
+  function ensureSessionEl() {
+    if (!sessionEl) sessionEl = document.getElementById('soundloop');
+    if (sessionEl && !sessionEl.getAttribute('src')) sessionEl.setAttribute('src', silentWavUri());
+    return sessionEl;
+  }
+
+  function playSessionEl() {
+    const el = ensureSessionEl();
+    if (!el || !el.paused) return;
+    try {
+      // на iOS это переводит аудиосессию в playback и обходит бесшумный переключатель
+      const p = el.play();
+      if (p && p.catch) p.catch((e) => {
+        if (!e || e.name !== 'AbortError') lastError = 'audio el: ' + errText(e);
+      });
+    } catch (e) {
+      if (!e || e.name !== 'AbortError') lastError = 'audio el: ' + errText(e);
+    }
+  }
+
+  function unlock(source) {
+    const now = performance.now();
+    // Safari считает активацией не каждый pointerdown: touchend и click
+    // всегда проходят полный путь, даже если pointerdown уже был
+    const repeat = (source === 'touchend' || source === 'click') && now - lastPointerAt < 700;
+    if (source === 'pointerdown' || source === 'keydown') lastPointerAt = now;
+    gestureSource = source;
+    if (!repeat) {
+      unlockAttempts++;
+      stateBeforeGesture = ctx ? ctx.state : 'idle';
+    }
+    if (!ensure()) {
+      stateAfterGesture = 'idle';
+      updateHint();
+      return false;
+    }
+    setPlaybackSession();
+    resumeSync();
+    primeOutput();
+    playSessionEl();
+    stateAfterGesture = ctx.state;
+    updateHint();
+    return true;
+  }
+
+  function resumeOnReturn(source) {
+    if (!ctx) return;
+    gestureSource = source;
+    setPlaybackSession();
+    resumeSync();
+    if (ctx.state === 'running') {
+      primeOutput();
+      playSessionEl();
+    }
+    updateHint();
+  }
+
   function start() {
-    if (!ensure()) return false;
+    if (!ensure()) { updateHint(); return false; }
     if (!started) {
       started = true;
+      startedAt = performance.now();
+      silentFor = 0;
+      lastRmsAt = startedAt;
       nextAt = ctx.currentTime + 0.06;
       timer = setInterval(schedule, 25);
       lastEvent = 'start';
     }
-    resumeIfNeeded();
+    setPlaybackSession();
+    resumeSync();
+    if (ctx.state === 'running') {
+      const t = ctx.currentTime;
+      master.gain.cancelScheduledValues(t);
+      master.gain.setTargetAtTime(muted ? 0 : MASTER_LEVEL, t, 0.02);
+    } else if (!muted) {
+      master.gain.value = MASTER_LEVEL;
+    }
+    primeOutput();
+    playSessionEl();
     schedule();
+    updateHint();
     return true;
   }
 
@@ -1735,9 +1912,11 @@ const audio = (() => {
     if (ctx && master) {
       const t = ctx.currentTime;
       master.gain.cancelScheduledValues(t);
-      master.gain.setTargetAtTime(muted ? 0 : MASTER_LEVEL, t, 0.012);
+      master.gain.setTargetAtTime((muted || !started) ? 0 : MASTER_LEVEL, t, 0.012);
     }
+    if (!muted) resumeOnReturn('unmute');
     lastEvent = muted ? 'mute' : 'unmute';
+    updateHint();
     return muted;
   }
 
@@ -2164,10 +2343,87 @@ const audio = (() => {
     return max;
   }
 
+  /* ---------- подсказка о звуке ---------- */
+
+  function hintNode() {
+    if (!hintEl) hintEl = document.getElementById('soundhint');
+    return hintEl;
+  }
+
+  function updateHint() {
+    const el = hintNode();
+    if (!el) return;
+    const startEl = document.getElementById('start');
+    const atStart = !!startEl && !startEl.classList.contains('hidden');
+    if (atStart !== hintStart) {
+      hintStart = atStart;
+      el.classList.toggle('atstart', atStart);
+    }
+    let text = '';
+    let bad = false;
+    if (muted) {
+      text = 'ЗВУК ВЫКЛ\nнажми «ЗВУК ВКЛ» в правом верхнем углу';
+    } else if (!ctx) {
+      text = started
+        ? 'ЗВУК НЕДОСТУПЕН\nбраузер не дал создать WebAudio'
+        : 'ЗВУК: ЖДЁМ КАСАНИЯ\nтапни по экрану или нажми пробел';
+      bad = started;
+    } else if (ctx.state !== 'running') {
+      text = started
+        ? 'НАЖМИ ЕЩЁ РАЗ ДЛЯ ЗВУКА\nбраузер не запустил звук с первого касания'
+        : 'ЗВУК: ЖДЁМ КАСАНИЯ\nтапни по экрану или нажми пробел';
+      bad = true;
+    } else if (silentFor >= 2) {
+      text = 'ТИХИЙ РЕЖИМ ИЛИ ВЫКЛЮЧЕН ЗВУК\nпроверь переключатель звука на телефоне';
+      bad = true;
+    }
+    if (text !== hintText) {
+      el.textContent = text;
+      hintText = text;
+    }
+    const on = text !== '';
+    if (on !== hintOn) {
+      hintOn = on;
+      el.classList.toggle('on', on);
+    }
+    if (bad !== hintBad) {
+      hintBad = bad;
+      el.classList.toggle('bad', bad);
+    }
+  }
+
+  // вызывается из кадра, не чаще 4 раз в секунду
+  function tick(now) {
+    if (now - lastTickAt < 250) return;
+    lastTickAt = now;
+    if (!ctx || !started || muted || document.hidden || ctx.state !== 'running') {
+      silentFor = 0;
+      lastRmsAt = now;
+      updateHint();
+      return;
+    }
+    const dt = Math.min(1, Math.max(0, (now - lastRmsAt) / 1000));
+    lastRmsAt = now;
+    if (rms() >= 0.004) silentFor = 0;
+    else silentFor += dt;
+    updateHint();
+  }
+
   function dbg() {
     return {
       state: ctx ? ctx.state : 'idle',
-      master: muted ? 0 : MASTER_LEVEL,
+      sampleRate: ctx ? ctx.sampleRate : 0,
+      sessionType: sessionType(),
+      unlockAttempts,
+      lastError,
+      gestureSource,
+      contextCount,
+      stateBeforeGesture,
+      stateAfterGesture,
+      started,
+      runningFor: started ? Math.round((performance.now() - startedAt) / 100) / 10 : 0,
+      silentFor: Math.round(silentFor * 10) / 10,
+      master: (muted || !started) ? 0 : MASTER_LEVEL,
       music: MUSIC_LEVEL,
       sfx: SFX_LEVEL,
       muted,
@@ -2177,12 +2433,19 @@ const audio = (() => {
     };
   }
 
-  window.addEventListener('pointerdown', resumeIfNeeded, true);
-  window.addEventListener('keydown', resumeIfNeeded, true);
+  // жесты: создание/резюм строго синхронно в обработчике первого касания
+  window.addEventListener('pointerdown', () => unlock('pointerdown'), true);
+  window.addEventListener('touchend', () => unlock('touchend'), true);
+  window.addEventListener('click', () => unlock('click'), true);
+  window.addEventListener('keydown', (e) => { if (!e.repeat) unlock('keydown'); }, true);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeOnReturn('visibilitychange');
+  });
+  window.addEventListener('pageshow', () => resumeOnReturn('pageshow'));
 
   return {
     start, setMuted, toggleMute, isMuted: () => muted,
-    rms, peak, dbg,
+    rms, peak, dbg, tick, unlock, context: () => ctx,
     sfx: { siren, woop, warning, granny },
   };
 })();
@@ -3384,6 +3647,7 @@ function frame(now) {
     guard++;
   }
   if (guard >= 8) acc = 0;
+  audio.tick(now);
   render();
 }
 
@@ -3402,6 +3666,8 @@ window.__game = {
     rms: () => audio.rms(),
     peak: () => audio.peak(),
     start: () => audio.start(),
+    unlock: (source) => audio.unlock(source || 'debug'),
+    context: () => audio.context(),
     toggle: () => { const m = audio.toggleMute(); syncSndUI(); return m; },
     setMuted: (v) => { const m = audio.setMuted(v); syncSndUI(); return m; },
     siren: (dur) => audio.sfx.siren(dur),

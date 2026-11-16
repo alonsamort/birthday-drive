@@ -94,6 +94,49 @@
     color: rgba(230, 226, 216, 0.5);
     border-color: rgba(230, 226, 216, 0.22);
   }
+  /* ---- подсказка о звуке: только когда звук не работает ---- */
+  #soundhint {
+    position: fixed;
+    left: 50%;
+    top: 42%;
+    transform: translate(-50%, -50%);
+    z-index: 9;
+    display: none;
+    pointer-events: none;
+    box-sizing: border-box;
+    max-width: min(86vw, 460px);
+    padding: 0.6em 0.9em;
+    font-size: clamp(10px, 2.2vmin, 15px);
+    line-height: 1.4;
+    letter-spacing: 0.08em;
+    text-align: center;
+    white-space: pre-line;
+    color: var(--lamp);
+    background: rgba(20, 8, 10, 0.95);
+    border: 1px solid rgba(255, 217, 160, 0.55);
+    box-shadow: 0 3px 0 rgba(0, 0, 0, 0.5);
+    text-shadow: 0 2px 0 rgba(0, 0, 0, 0.85);
+  }
+  #soundhint.on { display: block; }
+  /* на стартовом экране — ниже инструкции, чтобы не закрывать её */
+  #soundhint.atstart {
+    top: auto;
+    bottom: 12vh;
+    transform: translateX(-50%);
+  }
+  #soundhint.bad {
+    color: #ffb8b8;
+    border-color: rgba(255, 150, 150, 0.7);
+  }
+  #soundloop {
+    position: fixed;
+    left: -9999px;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
   #clockbox {
     position: absolute;
     left: 3.2vmin;
@@ -455,6 +498,9 @@
   <div id="warn">ПЕРЕКРЁСТОК</div>
   <div id="brakepad">ТОРМОЗ</div>
 </div>
+
+<div id="soundhint" role="status" aria-live="polite"></div>
+<audio id="soundloop" loop playsinline webkit-playsinline preload="auto" aria-hidden="true"></audio>
 
 <div id="start" class="screen">
   <h1>18:52 · ДЕНЬ РОЖДЕНИЯ</h1>
