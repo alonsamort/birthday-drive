@@ -67,6 +67,33 @@
     letter-spacing: 0.06em;
     text-shadow: 0 2px 0 rgba(0,0,0,0.85), 0 0 12px rgba(0,0,0,0.55);
   }
+  /* ---- звук: единственный интерактивный элемент в HUD ---- */
+  #snd {
+    position: absolute;
+    right: max(3.2vmin, env(safe-area-inset-right));
+    top: max(3vmin, env(safe-area-inset-top));
+    margin: 0;
+    pointer-events: auto;
+    font: inherit;
+    font-size: 0.78em;
+    letter-spacing: 0.08em;
+    line-height: 1;
+    padding: 0.62em 0.72em;
+    min-width: 2.4em;
+    min-height: 2.4em;
+    color: var(--cream);
+    background: rgba(20, 8, 10, 0.6);
+    border: 1px solid rgba(230, 226, 216, 0.45);
+    box-shadow: none;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  #snd:hover { background: rgba(40, 18, 22, 0.75); color: #fff; }
+  #snd:active { transform: translate(1px, 1px); box-shadow: none; }
+  #snd[aria-pressed="true"] {
+    color: rgba(230, 226, 216, 0.5);
+    border-color: rgba(230, 226, 216, 0.22);
+  }
   #clockbox {
     position: absolute;
     left: 3.2vmin;
@@ -410,6 +437,7 @@
 <div id="vignette"></div>
 
 <div id="hud">
+  <button id="snd" type="button" aria-pressed="false" aria-label="Выключить звук" title="Звук">ЗВУК ВКЛ</button>
   <div id="mood">
     <div>Настроение <span id="moodpct">100%</span></div>
     <div id="moodbar"><div id="moodfill"></div><div id="moodmark"></div></div>

@@ -1113,6 +1113,7 @@ function updateCrossings(dt) {
     if (d > 0 && d < 85 && !c.warned) {
       c.warned = true;
       S.warnT = Math.max(S.warnT, clamp(d / Math.max(S.speed, 12), 1.2, 2.0));
+      audio.sfx.warning();
       if (!S.seen['cross_' + c.kind.id]) {
         S.seen['cross_' + c.kind.id] = true;
         say('ПЕРЕКРЁСТОК · ' + c.kind.hint, 3.2);
@@ -1603,6 +1604,605 @@ function clearDyn() {
   E = {};
 }
 
+/* =====================================================================
+   ЗВУК — синтез в WebAudio, без файлов и без сборки
+   ===================================================================== */
+
+const audio = (() => {
+  const BPM = 92;
+  const STEP_BASE = 60 / BPM / 4;   // 16-я нота
+  const SWING_EVEN = 1.16;          // лёгкий свинг: длинная-короткая пара
+  const SWING_ODD = 0.84;
+  const MUSIC_LEVEL = 0.22;
+  const SFX_LEVEL = 0.62;
+  const MASTER_LEVEL = 1;
+
+  let ctx = null;
+  let master = null;
+  let comp = null;
+  let analyser = null;
+  let music = null;
+  let sfx = null;
+  let noise = null;
+  let buf = null;
+  let started = false;
+  let step = 0;
+  let nextAt = 0;
+  let lastEvent = 'none';
+  let muted = false;
+  let sirenUntil = 0;
+  let timer = null;
+
+  const hash = (n) => {
+    const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+    return x - Math.floor(x);
+  };
+
+  function ensure() {
+    if (ctx) return ctx;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try {
+      ctx = new AC();
+    } catch (_) {
+      ctx = null;
+      return null;
+    }
+    comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -14;
+    comp.knee.value = 8;
+    comp.ratio.value = 5;
+    comp.attack.value = 0.004;
+    comp.release.value = 0.18;
+
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 8192;          // ~186 мс: RMS не прыгает между шагами
+    analyser.smoothingTimeConstant = 0;
+    buf = new Float32Array(analyser.fftSize);
+
+    master = ctx.createGain();
+    master.gain.value = muted ? 0 : MASTER_LEVEL;
+    music = ctx.createGain();
+    music.gain.value = MUSIC_LEVEL;
+    sfx = ctx.createGain();
+    sfx.gain.value = SFX_LEVEL;
+
+    music.connect(master);
+    sfx.connect(master);
+    master.connect(comp);
+    comp.connect(analyser);
+    analyser.connect(ctx.destination);
+
+    // один буфер шума на все хэты, снейры и краши
+    const n = Math.floor(ctx.sampleRate * 2);
+    const b = ctx.createBuffer(1, n, ctx.sampleRate);
+    const d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    noise = b;
+
+    // тихий непрерывный пад: музыка не проваливается в ноль между ударами
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 1100;
+    lp.Q.value = 0.4;
+    const pad = ctx.createGain();
+    pad.gain.value = 0.13;
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.11;
+    const lfoG = ctx.createGain();
+    lfoG.gain.value = 0.01;
+    lfo.connect(lfoG);
+    lfoG.connect(pad.gain);
+    lp.connect(pad);
+    pad.connect(music);
+    for (const f of [220, 261.63, 329.63]) {
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = f;
+      const og = ctx.createGain();
+      og.gain.value = 0.34;
+      o.connect(og);
+      og.connect(lp);
+      o.start();
+    }
+    lfo.start();
+    return ctx;
+  }
+
+  function resumeIfNeeded() {
+    if (started && ctx && ctx.state === 'suspended') {
+      const p = ctx.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+  }
+
+  function start() {
+    if (!ensure()) return false;
+    if (!started) {
+      started = true;
+      nextAt = ctx.currentTime + 0.06;
+      timer = setInterval(schedule, 25);
+      lastEvent = 'start';
+    }
+    resumeIfNeeded();
+    schedule();
+    return true;
+  }
+
+  function setMuted(v) {
+    muted = !!v;
+    if (ctx && master) {
+      const t = ctx.currentTime;
+      master.gain.cancelScheduledValues(t);
+      master.gain.setTargetAtTime(muted ? 0 : MASTER_LEVEL, t, 0.012);
+    }
+    lastEvent = muted ? 'mute' : 'unmute';
+    return muted;
+  }
+
+  function toggleMute() {
+    return setMuted(!muted);
+  }
+
+  function dispose(nodes) {
+    return () => {
+      for (const n of nodes) {
+        try { n.disconnect(); } catch (_) { /* уже отключён */ }
+      }
+    };
+  }
+
+  /* ---------- ударные ---------- */
+
+  function kick(t, vel = 1) {
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(120, t);
+    o.frequency.exponentialRampToValueAtTime(50, t + 0.11);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.9 * vel, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+    o.connect(g);
+    g.connect(music);
+    o.start(t);
+    o.stop(t + 0.28);
+    o.onended = dispose([o, g]);
+
+    // щелчок по верхушке — бочка читается даже на телефоне
+    const n = ctx.createBufferSource();
+    n.buffer = noise;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 1500;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.12 * vel, t);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.03);
+    n.connect(hp);
+    hp.connect(ng);
+    ng.connect(music);
+    n.start(t);
+    n.stop(t + 0.04);
+    n.onended = dispose([n, hp, ng]);
+  }
+
+  function snare(t, vel = 1, ghost = false) {
+    const n = ctx.createBufferSource();
+    n.buffer = noise;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 650;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1900;
+    bp.Q.value = 0.9;
+    const g = ctx.createGain();
+    const peak = (ghost ? 0.16 : 0.5) * vel;
+    const dur = ghost ? 0.09 : 0.2;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(peak, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    n.connect(hp);
+    hp.connect(bp);
+    bp.connect(g);
+    g.connect(music);
+    n.start(t);
+    n.stop(t + dur + 0.03);
+    n.onended = dispose([n, hp, bp, g]);
+
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(190, t);
+    o.frequency.exponentialRampToValueAtTime(120, t + 0.07);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.linearRampToValueAtTime((ghost ? 0.04 : 0.15) * vel, t + 0.004);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+    o.connect(og);
+    og.connect(music);
+    o.start(t);
+    o.stop(t + 0.13);
+    o.onended = dispose([o, og]);
+  }
+
+  function hat(t, vel = 1, open = false) {
+    const n = ctx.createBufferSource();
+    n.buffer = noise;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 7200;
+    hp.Q.value = 0.7;
+    const g = ctx.createGain();
+    const dur = open ? 0.16 : 0.045;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime((open ? 0.15 : 0.19) * vel, t + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    n.connect(hp);
+    hp.connect(g);
+    g.connect(music);
+    n.start(t);
+    n.stop(t + dur + 0.02);
+    n.onended = dispose([n, hp, g]);
+  }
+
+  function bass(t, freq, dur = 0.14, vel = 1) {
+    const o = ctx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(freq, t);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.Q.value = 7;
+    lp.frequency.setValueAtTime(520, t);
+    lp.frequency.exponentialRampToValueAtTime(240, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.24 * vel, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.03);
+    o.connect(lp);
+    lp.connect(g);
+    g.connect(music);
+    o.start(t);
+    o.stop(t + dur + 0.05);
+    o.onended = dispose([o, lp, g]);
+  }
+
+  function accent(t, vel = 1) {
+    // короткий шумовой краш
+    const n = ctx.createBufferSource();
+    n.buffer = noise;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 3600;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.1 * vel, t + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.42);
+    n.connect(hp);
+    hp.connect(g);
+    g.connect(music);
+    n.start(t);
+    n.stop(t + 0.44);
+    n.onended = dispose([n, hp, g]);
+
+    // низкий стаб на сильной доле
+    const o = ctx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(110, t);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 760;
+    lp.Q.value = 3;
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.linearRampToValueAtTime(0.075 * vel, t + 0.01);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+    o.connect(lp);
+    lp.connect(og);
+    og.connect(music);
+    o.start(t);
+    o.stop(t + 0.32);
+    o.onended = dispose([o, lp, og]);
+  }
+
+  /* ---------- секвенсор ---------- */
+
+  function stepLen(i) {
+    return STEP_BASE * (i % 2 === 0 ? SWING_EVEN : SWING_ODD);
+  }
+
+  function scheduleStep(i, t) {
+    const seg = clamp(S.seg, 0, 2);
+    const s = i % 16;
+    const bar = Math.floor(i / 16);
+    const bar8 = bar % 8;
+    const fill = bar8 === 7;
+    const h = hash(i);
+
+    if (seg === 0) {
+      // первый отрезок: бит без баса, редкие восьмые хэты
+      if (s === 0 || s === 8) kick(t, 1);
+      else if (s === 7 || s === 14) kick(t, 0.72);
+      if (s === 4 || s === 12) snare(t, 0.92);
+      if (s % 2 === 0) hat(t, s % 4 === 0 ? 0.9 : 0.55);
+      if (s === 15 && h > 0.6) snare(t, 0.4, true);
+      return;
+    }
+
+    if (s === 0 || s === 8) kick(t, 1);
+    else if (s === 3 || s === 7 || s === 11) kick(t, 0.78);
+    else if (s === 14) kick(t, 0.62);
+    else if (s === 13 && h > 0.62) kick(t, 0.5);
+
+    if (s === 4 || s === 12) snare(t, 1);
+    else if (!fill && (s === 7 || s === 15) && h > 0.55) snare(t, 0.42, true);
+    if (fill && s >= 12) snare(t, 0.35 + (s - 12) * 0.2);
+
+    // полные шестнадцатые с акцентами на восьмых
+    hat(t, s % 4 === 0 ? 1 : (s % 2 === 0 ? 0.68 : 0.42), s === 14 && bar8 % 2 === 0);
+    if (seg === 2 && s % 2 === 1 && h > 0.7) hat(t + STEP_BASE * 0.5, 0.3);
+
+    const root = [55, 55, 65.41, 49][bar % 4];
+    if (s === 0) bass(t, root, 0.24, 1);
+    else if (s === 8) bass(t, root, 0.2, 0.95);
+    else if (s === 3 || s === 11) bass(t, root * 2, 0.12, 0.72);
+    else if (s === 6) bass(t, root * 1.5, 0.14, 0.8);
+    else if (s === 14 && !fill) bass(t, root * 1.5, 0.12, 0.65);
+
+    if (seg === 2) {
+      if (bar % 4 === 0 && s === 0) accent(t, 1);
+      if (bar % 8 === 4 && s === 8) accent(t, 0.6);
+    }
+  }
+
+  function schedule() {
+    if (!ctx || !started || ctx.state !== 'running') return;
+    const horizon = ctx.currentTime + 0.18;
+    let guard = 0;
+    while (nextAt < horizon && guard < 40) {
+      // после фонового таба не выстреливаем пачкой в прошлое
+      if (nextAt < ctx.currentTime - 0.08) nextAt = ctx.currentTime + 0.01;
+      scheduleStep(step, nextAt);
+      nextAt += stepLen(step);
+      step++;
+      guard++;
+    }
+  }
+
+  /* ---------- эффекты ---------- */
+
+  function siren(dur = 2.6, level = 1) {
+    lastEvent = 'siren';
+    if (!ensure() || !ctx || ctx.state !== 'running') return false;
+    const now = ctx.currentTime;
+    if (now < sirenUntil - 0.15) return false; // не накладываем две сирены
+    sirenUntil = now + dur;
+    const t = now + 0.02;
+    const out = ctx.createGain();
+    out.gain.setValueAtTime(0.0001, t);
+    out.gain.linearRampToValueAtTime(0.34 * level, t + 0.1);
+    out.gain.setValueAtTime(0.34 * level, t + Math.max(0.12, dur - 0.3));
+    out.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2100;
+    lp.Q.value = 0.8;
+
+    const saw = ctx.createOscillator();
+    saw.type = 'sawtooth';
+    const sq = ctx.createOscillator();
+    sq.type = 'square';
+    const sqg = ctx.createGain();
+    sqg.gain.value = 0.34;
+    for (const o of [saw, sq]) {
+      o.frequency.setValueAtTime(690, t);
+      for (let when = t + 0.27, k = 1; when < t + dur - 0.05; when += 0.27, k++) {
+        o.frequency.linearRampToValueAtTime(k % 2 ? 920 : 690, when);
+      }
+    }
+    saw.connect(lp);
+    sq.connect(sqg);
+    sqg.connect(lp);
+    lp.connect(out);
+    out.connect(sfx);
+    saw.start(t);
+    sq.start(t);
+    saw.stop(t + dur + 0.02);
+    sq.stop(t + dur + 0.02);
+    saw.onended = dispose([saw, sq, sqg, lp, out]);
+    return true;
+  }
+
+  function woop(level = 1) {
+    lastEvent = 'woop';
+    if (!ensure() || !ctx || ctx.state !== 'running') return false;
+    const t = ctx.currentTime + 0.01;
+    const o = ctx.createOscillator();
+    o.type = 'square';
+    o.frequency.setValueAtTime(420, t);
+    o.frequency.exponentialRampToValueAtTime(980, t + 0.16);
+    o.frequency.exponentialRampToValueAtTime(380, t + 0.42);
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 950;
+    bp.Q.value = 1.1;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.28 * level, t + 0.03);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.45);
+    o.connect(bp);
+    bp.connect(g);
+    g.connect(sfx);
+    o.start(t);
+    o.stop(t + 0.46);
+    o.onended = dispose([o, bp, g]);
+    return true;
+  }
+
+  function warning() {
+    woop(0.9);
+    siren(2.6, 1);
+  }
+
+  function granny() {
+    lastEvent = 'granny';
+    if (!ensure() || !ctx || ctx.state !== 'running') return false;
+    const t = ctx.currentTime + 0.01;
+
+    // «Ай!»: пила с падением высоты и вибрато, две форманты
+    const voice = ctx.createOscillator();
+    voice.type = 'sawtooth';
+    voice.frequency.setValueAtTime(430, t);
+    voice.frequency.linearRampToValueAtTime(560, t + 0.09);
+    voice.frequency.exponentialRampToValueAtTime(215, t + 0.7);
+
+    const vib = ctx.createOscillator();
+    vib.type = 'sine';
+    vib.frequency.value = 6.4;
+    const vibG = ctx.createGain();
+    vibG.gain.value = 16;
+    vib.connect(vibG);
+    vibG.connect(voice.frequency);
+
+    const f1 = ctx.createBiquadFilter();
+    f1.type = 'bandpass';
+    f1.frequency.value = 700;
+    f1.Q.value = 6;
+    const f2 = ctx.createBiquadFilter();
+    f2.type = 'bandpass';
+    f2.frequency.value = 1200;
+    f2.Q.value = 8;
+    const f2g = ctx.createGain();
+    f2g.gain.value = 0.85;
+    const mix = ctx.createGain();
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.65, t + 0.03);
+    g.gain.setValueAtTime(0.65, t + 0.35);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.82);
+    voice.connect(f1);
+    voice.connect(f2);
+    f2.connect(f2g);
+    f1.connect(mix);
+    f2g.connect(mix);
+    mix.connect(g);
+    g.connect(sfx);
+    voice.start(t);
+    vib.start(t);
+    voice.stop(t + 0.84);
+    vib.stop(t + 0.84);
+    voice.onended = dispose([voice, vib, vibG, f1, f2, f2g, mix, g]);
+
+    // короткое ворчание ниже — «…чтоб тебя», заходит под крик без провала
+    const low = ctx.createOscillator();
+    low.type = 'sawtooth';
+    low.frequency.setValueAtTime(128, t + 0.34);
+    low.frequency.exponentialRampToValueAtTime(92, t + 0.78);
+    const lf1 = ctx.createBiquadFilter();
+    lf1.type = 'bandpass';
+    lf1.frequency.value = 320;
+    lf1.Q.value = 5;
+    const lf2 = ctx.createBiquadFilter();
+    lf2.type = 'bandpass';
+    lf2.frequency.value = 620;
+    lf2.Q.value = 6;
+    const lg = ctx.createGain();
+    lg.gain.setValueAtTime(0.0001, t + 0.34);
+    lg.gain.linearRampToValueAtTime(0.26, t + 0.39);
+    lg.gain.exponentialRampToValueAtTime(0.0001, t + 0.86);
+    low.connect(lf1);
+    low.connect(lf2);
+    lf1.connect(lg);
+    lf2.connect(lg);
+    lg.connect(sfx);
+    low.start(t + 0.34);
+    low.stop(t + 0.88);
+    low.onended = dispose([low, lf1, lf2, lg]);
+    return true;
+  }
+
+  /* ---------- замер и отладка ---------- */
+
+  function rms() {
+    if (!analyser) return 0;
+    let sum = 0;
+    if (analyser.getFloatTimeDomainData) {
+      analyser.getFloatTimeDomainData(buf);
+      for (let i = 0; i < buf.length; i++) {
+        const v = buf[i];
+        sum += v * v;
+      }
+      return Math.sqrt(sum / buf.length);
+    }
+    const b = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(b);
+    for (let i = 0; i < b.length; i++) {
+      const v = (b[i] - 128) / 128;
+      sum += v * v;
+    }
+    return Math.sqrt(sum / b.length);
+  }
+
+  function peak() {
+    if (!analyser) return 0;
+    let max = 0;
+    if (analyser.getFloatTimeDomainData) {
+      analyser.getFloatTimeDomainData(buf);
+      for (let i = 0; i < buf.length; i++) {
+        const v = Math.abs(buf[i]);
+        if (v > max) max = v;
+      }
+      return max;
+    }
+    const b = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(b);
+    for (let i = 0; i < b.length; i++) {
+      const v = Math.abs((b[i] - 128) / 128);
+      if (v > max) max = v;
+    }
+    return max;
+  }
+
+  function dbg() {
+    return {
+      state: ctx ? ctx.state : 'idle',
+      master: muted ? 0 : MASTER_LEVEL,
+      music: MUSIC_LEVEL,
+      sfx: SFX_LEVEL,
+      muted,
+      bpm: BPM,
+      step,
+      lastEvent,
+    };
+  }
+
+  window.addEventListener('pointerdown', resumeIfNeeded, true);
+  window.addEventListener('keydown', resumeIfNeeded, true);
+
+  return {
+    start, setMuted, toggleMute, isMuted: () => muted,
+    rms, peak, dbg,
+    sfx: { siren, woop, warning, granny },
+  };
+})();
+
+/* ---------- кнопка звука в HUD ---------- */
+const sndEl = document.getElementById('snd');
+function syncSndUI() {
+  const m = audio.isMuted();
+  sndEl.textContent = m ? 'ЗВУК ВЫКЛ' : 'ЗВУК ВКЛ';
+  sndEl.setAttribute('aria-pressed', m ? 'true' : 'false');
+  sndEl.setAttribute('aria-label', m ? 'Включить звук' : 'Выключить звук');
+}
+sndEl.addEventListener('click', (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  audio.toggleMute();
+  syncSndUI();
+});
+syncSndUI();
+
 /* ---------- HUD ---------- */
 const clockEl = document.getElementById('clock');
 const moodPctEl = document.getElementById('moodpct');
@@ -2024,6 +2624,8 @@ function hit(kind, sec = HIT_CLOCK, moodLoss = 12) {
   S.mood = Math.max(0, S.mood - moodLoss);
   S.moodDrain = { src: `hit:${kind}`, value: moodLoss, at: S.time, until: S.time + 2 };
   S.hitKinds[kind] = (S.hitKinds[kind] || 0) + 1;
+  if (kind === 'granny') audio.sfx.granny();
+  else if (kind === 'crossing' || kind === 'oncoming') audio.sfx.siren(2.4);
   const captions = {
     cow: 'Корова. Она тут живёт.\nНастроение −12% · −30 секунд',
     mower: 'Сосед не остановился. Настроение −12% · −30 секунд',
@@ -2625,6 +3227,7 @@ function buildFinaleProps() {
 }
 
 function startRun(fromStart) {
+  audio.start();
   if (fromStart) {
     S.p = 0;
     S.clock = 0;
@@ -2682,6 +3285,7 @@ function startRun(fromStart) {
 }
 
 function retrySegment() {
+  audio.start();
   S.clock = S.checkpoint.clock;
   S.mood = S.checkpoint.mood;
   S.p = SEGMENTS[S.seg].start + 1;
@@ -2793,6 +3397,18 @@ document.getElementById('loading').textContent = 'три.js на месте · �
 /* отладка для проверки (не мешает игре) */
 window.__game = {
   S, scene, camera, renderer, LANES, ROUTE, MOOD_WIN, police, playerCar,
+  audio: {
+    dbg: () => audio.dbg(),
+    rms: () => audio.rms(),
+    peak: () => audio.peak(),
+    start: () => audio.start(),
+    toggle: () => { const m = audio.toggleMute(); syncSndUI(); return m; },
+    setMuted: (v) => { const m = audio.setMuted(v); syncSndUI(); return m; },
+    siren: (dur) => audio.sfx.siren(dur),
+    woop: () => audio.sfx.woop(),
+    granny: () => audio.sfx.granny(),
+  },
+  hit: (kind) => { S.invuln = 0; hit(kind); },
   get phase() { return S.phase; },
   start: () => startRun(true),
   snapCamera: () => {
@@ -2825,7 +3441,7 @@ window.__game = {
     onScreen: window.__game.onScreen(E.bride.obj.position.x, 1.2, E.bride.obj.position.z),
   } : null,
   hudRects: () => {
-    const ids = ['mood', 'clockbox', 'speed', 'seg', 'turn', 'warn', 'invert', 'brakepad'];
+    const ids = ['mood', 'clockbox', 'speed', 'seg', 'turn', 'warn', 'invert', 'brakepad', 'snd'];
     const out = {};
     for (const id of ids) {
       const el = document.getElementById(id);
