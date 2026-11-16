@@ -94,6 +94,7 @@
     opacity: 0.9;
   }
   #moodbar {
+    position: relative;
     margin-top: 0.5em;
     width: 13vmin;
     height: 0.7vmin;
@@ -101,18 +102,36 @@
     background: rgba(230, 226, 216, 0.18);
     box-shadow: 0 0 0 1px rgba(0,0,0,0.5);
   }
+  #moodmark {
+    position: absolute;
+    left: 50%;
+    top: -2px;
+    bottom: -2px;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--lamp);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.55);
+  }
   #moodfill {
     height: 100%;
     width: 100%;
     background: var(--cream);
     transition: width 0.25s ease-out;
   }
+  #mood::after {
+    content: "цель 50%";
+    display: block;
+    margin-top: 0.42em;
+    font-size: 0.72em;
+    opacity: 0.66;
+    letter-spacing: 0.04em;
+  }
   #caption {
     position: absolute;
     left: 50%;
     transform: translateX(-50%);
     bottom: 16.5vmin;
-    width: min(84vw, 720px);
+    width: min(90vw, 720px);
     text-align: center;
     font-size: 1.12em;
     line-height: 1.45;
@@ -120,6 +139,7 @@
     opacity: 0;
     transition: opacity 0.22s linear;
     white-space: pre-line;
+    overflow-wrap: break-word;
   }
   #caption.on { opacity: 1; }
   #sub.on { opacity: 0.7; }
@@ -128,7 +148,7 @@
     transition: opacity 0.22s linear;
     position: absolute;
     left: 3.2vmin;
-    bottom: 13.5vmin;
+    top: 18vmin;
     font-size: 0.82em;
     text-align: left;
     max-width: 40vw;
@@ -136,7 +156,7 @@
   #invert {
     position: absolute;
     right: 3.2vmin;
-    top: 3vmin;
+    top: 16vmin;
     font-size: 0.95em;
     color: #ffb8b8;
     opacity: 0;
@@ -179,11 +199,41 @@
     transition: opacity 0.12s linear;
   }
   #turn { top: 3vmin; color: var(--lamp); }
-  #warn { top: 7.6vmin; color: #fff; }
+  #warn { top: 9.6vmin; color: #fff; }
   #turn.on { opacity: 1; }
   #warn.on {
     opacity: 1;
     animation: warnblink 0.42s steps(2, end) infinite;
+  }
+  /* ---- мобильный тормоз: нижняя четверть экрана ---- */
+  /* только граница зоны тормоза, чтобы не перекрывать нижний HUD */
+  #brakepad {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(25vh - 1.7em);
+    height: 1.7em;
+    display: none;
+    align-items: center;
+    justify-content: flex-end;
+    box-sizing: border-box;
+    padding-right: 3.2vmin;
+    border-top: 1px dashed rgba(255, 217, 160, 0.26);
+    font-size: 0.78em;
+    letter-spacing: 0.2em;
+    color: rgba(255, 217, 160, 0.72);
+  }
+  body.touch #brakepad.on { display: flex; }
+  body.touch #brakepad.braking {
+    border-top-color: rgba(255, 130, 130, 0.9);
+    color: #fff;
+  }
+  @media (pointer: coarse) {
+    #hud { font-size: clamp(13px, 3.2vmin, 20px); }
+    #caption {
+      bottom: calc(25vh + 18px);
+      font-size: clamp(15px, 3.5vmin, 24px);
+    }
   }
   @keyframes warnblink {
     0%, 49% { background: rgba(150, 30, 40, 0.85); color: #fff; }
@@ -264,16 +314,64 @@
     color: #e6e2d8;
     opacity: 0.88;
   }
-  .screen .keys {
-    margin-top: 1.6em;
-    font-size: clamp(10px, 1.7vmin, 15px);
-    opacity: 0.72;
-    letter-spacing: 0.08em;
-    line-height: 1.9;
+  /* ---- стартовая инструкция ---- */
+  #start { padding: 4vmin; }
+  #start h1 {
+    font-size: clamp(24px, 6.2vmin, 48px);
+    margin-bottom: 0.28em;
   }
-  .screen .keys b {
+  #start h2 {
+    font-size: clamp(14px, 3.2vmin, 26px);
+    margin-bottom: 1.1em;
+  }
+  .howto {
+    display: flex;
+    flex-direction: column;
+    gap: 0.62em;
+    width: min(92vw, 640px);
+    margin-bottom: 1.1em;
+    text-align: left;
+  }
+  .howto .row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.7em;
+    font-size: clamp(15px, 3.8vmin, 23px);
+    line-height: 1.3;
+    color: #fff;
+  }
+  .howto b {
+    flex: 0 0 5.6em;
     color: #ffd9a0;
-    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+  #start button {
+    margin-top: 0.2em;
+    font-size: clamp(18px, 4.4vmin, 26px);
+    padding: 0.8em 2.4em;
+  }
+  #start .hint {
+    margin-top: 1em;
+    font-size: clamp(11px, 2.4vmin, 15px);
+    opacity: 0.62;
+    letter-spacing: 0.06em;
+  }
+  @media (orientation: landscape) and (max-height: 560px) {
+    #start { padding: 2vmin; }
+    #start h1 { font-size: clamp(18px, 4.4vmin, 32px); }
+    #start h2 { font-size: clamp(12px, 2.7vmin, 19px); margin-bottom: 0.6em; }
+    .howto {
+      gap: 0.22em;
+      margin-bottom: 0.55em;
+      width: min(96vw, 780px);
+    }
+    .howto .row { font-size: clamp(12px, 2.9vmin, 18px); }
+    .howto b { flex-basis: 5.2em; }
+    #start button {
+      font-size: clamp(14px, 3.3vmin, 21px);
+      padding: 0.55em 1.9em;
+    }
+    #start .hint { margin-top: 0.4em; font-size: 11px; }
   }
   button {
     margin-top: 2.2em;
@@ -314,7 +412,7 @@
 <div id="hud">
   <div id="mood">
     <div>Настроение <span id="moodpct">100%</span></div>
-    <div id="moodbar"><div id="moodfill"></div></div>
+    <div id="moodbar"><div id="moodfill"></div><div id="moodmark"></div></div>
   </div>
   <div id="invert">ГОЛУБЬ В САЛОНЕ<br><span id="inverts">5.0</span> · всё наоборот</div>
   <div id="clockbox">
@@ -327,20 +425,22 @@
   <div id="speed"><span id="speedval">0</span> <span class="unit">ед/с</span></div>
   <div id="turn">ПОВОРОТ →</div>
   <div id="warn">ПЕРЕКРЁСТОК</div>
+  <div id="brakepad">ТОРМОЗ</div>
 </div>
 
 <div id="start" class="screen">
   <h1>18:52 · ДЕНЬ РОЖДЕНИЯ</h1>
   <h2>ты выехал позже, чем хотел</h2>
-  <p>Впереди двор, шоссе и город. Сзади — полиция.<br>Сзади-сзади — ещё что-то.</p>
-  <p>Успей к 19:00. Всё, что случится, столкновения не отменяет.</p>
-  <div class="keys">
-    <b>← →</b> / <b>A D</b> — руль (держать) &nbsp;·&nbsp; <b>↓</b> / <b>S</b> — тормоз<br>
-    на телефоне: тап по левой половине — влево, по правой — вправо (тап — рывок, удержание — руль)<br>
-    два пальца — тормоз<br><br>
-    <b>ПРОБЕЛ</b> или клик — поехали
+  <div class="howto">
+    <div class="row"><b>РУЛЬ</b><span>держи левую или правую половину экрана</span></div>
+    <div class="row"><b>ТОРМОЗ</b><span>зажми нижнюю четверть экрана, отпусти — газ</span></div>
+    <div class="row"><b>ДОРОГА</b><span>объезжай ямы, машины и бабушек</span></div>
+    <div class="row"><b>ЦЕЛЬ</b><span>доехать с настроением не ниже 50%</span></div>
+    <div class="row"><b>ВРЕМЯ</b><span>успеть во двор до 19:00</span></div>
   </div>
-  <div class="tiny" id="loading">загружаем три.js</div>
+  <button id="go">ПОЕХАЛИ</button>
+  <div class="hint">или нажми пробел / тапни по экрану</div>
+  <div class="tiny" id="loading" hidden>загружаем три.js</div>
 </div>
 
 <div id="over" class="screen hidden">

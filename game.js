@@ -12,17 +12,26 @@ const LANE = 3.2;              // ширина полосы
 const LANES = [-LANE, 0, LANE]; // центры полос: авто-возврат руля
 const ROAD_HALF = 5.2;
 const SPEED_MAX = 46;          // единиц/сек
-const CLOCK_RATE = 0.58;       // игровых секунд на реальную
+const CLOCK_RATE = 0.94;       // игровых секунд на реальную (480 игровых ≈ 8.5 реальных минут)
 const CLOCK_MAX = 480;         // 18:52 → 19:00
 const HIT_CLOCK = 30;          // штраф за столкновение
-const ROUTE = 30000;           // ~11 минут при полном ходу
+const ROUTE = 18500;           // ~6.7 минут при полном ходу
+const MOOD_WIN = 50;           // меньше — финал-провал, даже если доехал
 const STEER_ACC = 20;          // боковое ускорение руля, ед/с²
 
 const SEGMENTS = [
-  { name: 'ДВОР', start: 0, end: 9500 },
-  { name: 'ШОССЕ', start: 9500, end: 19500 },
-  { name: 'ГОРОД', start: 19500, end: 30000 },
+  { name: 'ДВОР', start: 0, end: 5850 },
+  { name: 'ШОССЕ', start: 5850, end: 12050 },
+  { name: 'ГОРОД', start: 12050, end: 18500 },
 ];
+
+/* сюжетные точки (в единицах маршрута) */
+const COW_P = 1000;
+const MOWER_P = 2050;
+const BRIDE_P = 3300;          // первая треть первого отрезка, ~18% маршрута
+const HIGHWAY_PIGEON_P = SEGMENTS[1].start + 2800;
+const CITY_FUNERAL_P = SEGMENTS[2].start + 2010;
+const CITY_INSPECTOR_P = SEGMENTS[2].start + 3600;
 
 const PAL = {
   burgundy: 0x5b1f27,
@@ -58,20 +67,24 @@ const CURVE_HEAD = new Float32Array(CURVE_N);
 const CURVE_K = new Float32Array(CURVE_N);
 const BENDS = [];
 
+const BENDS_PER_SEGMENT = 6;
+
 function buildCurveModel() {
   const bends = [];
-  let p = 520;
   let off = 0;
-  while (p < ROUTE - 500) {
-    const half = rnd(95, 155);
-    const steep = rnd(0.00045, 0.00082);
-    let dir = Math.random() < 0.5 ? -1 : 1;
-    if (off > 14) dir = -1;
-    if (off < -14) dir = 1;
-    bends.push({ start: p, mid: p + half, end: p + half * 2, dir, steep, half });
-    off += dir * steep * half * half;
-    off = clamp(off, -30, 30);
-    p += half * 2 + rnd(1200, 1600);
+  for (const seg of SEGMENTS) {
+    const span = seg.end - seg.start;
+    for (let k = 0; k < BENDS_PER_SEGMENT; k++) {
+      const p = seg.start + span * ((k + 0.5) / BENDS_PER_SEGMENT + rnd(-0.02, 0.02));
+      const half = rnd(70, 110);
+      const steep = rnd(0.0009, 0.00125);
+      let dir = Math.random() < 0.5 ? -1 : 1;
+      if (off > 12) dir = -1;
+      if (off < -12) dir = 1;
+      bends.push({ start: p, mid: p + half, end: p + half * 2, dir, steep, half });
+      off += dir * steep * half * half;
+      off = clamp(off, -30, 30);
+    }
   }
   for (const b of bends) {
     const a = Math.max(1, Math.ceil(b.start / CURVE_STEP));
@@ -129,7 +142,10 @@ viewEl.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0x4a2029, 96, 190);
 
-const VIEW_SPAN = 27.5;  // высота кадра: машина крупная, но перекрёсток виден заранее
+const BASE_VIEW_SPAN = 27.5;  // высота кадра на большом экране
+const CLOSE_VIEW_SPAN = 20;   // на телефоне/узком экране: машина крупнее
+let VIEW_SPAN = BASE_VIEW_SPAN;
+let CAM_LOOKAHEAD = 21;       // камера смотрит вперёд по дороге
 
 const camera = new THREE.OrthographicCamera(
   (-VIEW_SPAN / 2) * (VIEW_W / VIEW_H),
@@ -140,10 +156,35 @@ const camera = new THREE.OrthographicCamera(
   400
 );
 
+const IS_COARSE = () =>
+  matchMedia('(pointer: coarse)').matches ||
+  (navigator.maxTouchPoints || 0) > 0;
+
+/* Кадр подстраивается под экран: на телефоне/в портрете камера ближе,
+   но горизонт по-прежнему вмещает дорогу с обочинами целиком. */
+function applyCameraFraming() {
+  const vw = Math.max(1, window.innerWidth);
+  const vh = Math.max(1, window.innerHeight);
+  const aspect = vw / vh;
+  const close = IS_COARSE() || aspect < 1.2;
+  VIEW_SPAN = close ? CLOSE_VIEW_SPAN : BASE_VIEW_SPAN;
+  CAM_LOOKAHEAD = close ? 26 : 21;
+  const spanW = VIEW_SPAN * (VIEW_W / VIEW_H);
+  camera.left = -spanW / 2;
+  camera.right = spanW / 2;
+  camera.top = VIEW_SPAN / 2;
+  camera.bottom = -VIEW_SPAN / 2;
+  camera.updateProjectionMatrix();
+  document.body.classList.toggle('touch', IS_COARSE());
+}
+applyCameraFraming();
+window.addEventListener('resize', applyCameraFraming);
+window.addEventListener('orientationchange', applyCameraFraming);
+
 /* фиксированная изометрия: небольшой yaw, чтобы видеть боковые фасады,
    но дорога при этом уходит вверх экрана */
 const CAM_YAW = THREE.MathUtils.degToRad(9);
-const CAM_PITCH = THREE.MathUtils.degToRad(21);
+const CAM_PITCH = THREE.MathUtils.degToRad(18);
 const CAM_RADIUS = 64;
 const CAM_OFFSET = new THREE.Vector3(
   Math.sin(CAM_YAW) * Math.cos(CAM_PITCH) * CAM_RADIUS,
@@ -994,15 +1035,34 @@ const CROSS_KINDS = [
   { id: 'granny', hw: 0.65, sp: 2.0, hint: 'БАБУШКА переходит. Пропусти.', build: makeCrossGranny },
 ];
 
+const CROSS_COUNT = 12;        // 20 перекрёстков на 30000 → 12 на 18500
+const CROSS_AVOID = [COW_P, MOWER_P, BRIDE_P, CITY_FUNERAL_P, CITY_INSPECTOR_P];
 const crossings = [];
 function initCrossings() {
-  let p = 1000;
-  let k = 0;
-  while (p < ROUTE - 700) {
-    p += rnd(1200, 1500);
-    if (p > ROUTE - 700) break;
+  const step = (ROUTE - 1600) / CROSS_COUNT;
+  const positions = [];
+  for (let k = 0; k < CROSS_COUNT; k++) {
+    let p = 900 + (k + 0.5) * step + rnd(-130, 130);
+    // не ставим перекрёсток на сюжетную сцену и не лепим их друг к другу
+    for (let guard = 0; guard < 8; guard++) {
+      let moved = false;
+      if (positions.length && p - positions[positions.length - 1] < 640) {
+        p = positions[positions.length - 1] + 640;
+        moved = true;
+      }
+      const near = CROSS_AVOID.find((a) => Math.abs(p - a) < 430);
+      if (near !== undefined) {
+        p = near + 430 + rnd(0, 90);
+        moved = true;
+      }
+      if (!moved) break;
+    }
+    if (p > ROUTE - 450) p = ROUTE - 450;
+    positions.push(p);
+  }
+  for (let k = 0; k < CROSS_COUNT; k++) {
+    const p = positions[k];
     const kind = CROSS_KINDS[k % CROSS_KINDS.length];
-    k++;
     // поперечная улица
     const street = new THREE.Mesh(new THREE.PlaneGeometry(90, 10), mat(0x45444a));
     street.rotation.x = -Math.PI / 2;
@@ -1057,7 +1117,9 @@ function updateCrossings(dt) {
     if (!c.started) {
       // выезд рассчитан так, чтобы корпус пересёк центр ровно к приезду игрока
       // и был виден в кадре >= 1 с до удара
-      const trig = Math.max(62, S.speed * 1.35);
+      // на узкой камере поперечная машина должна быть видна в кадре
+      // не меньше секунды до удара: выпускаем её раньше и плавнее
+      const trig = Math.max(100, S.speed * 1.9);
       if (d > 0 && d < trig) {
         c.started = true;
         c.veh.visible = true;
@@ -1505,7 +1567,8 @@ const S = {
   slowT: 0,
   slip: 0,             // занос после лужи
   invert: 0,
-  hintT: 22,
+  hintUsed: false,
+  controlHintOn: false,
   warnT: 0,
   turnT: 0,
   kerbT: -9,
@@ -1547,30 +1610,73 @@ const warnEl = document.getElementById('warn');
 const turnEl = document.getElementById('turn');
 const invertEl = document.getElementById('invert');
 const invertSEl = document.getElementById('inverts');
+const brakepadEl = document.getElementById('brakepad');
 
 let lastClockText = '';
 let lastMoodText = '';
 let lastSegText = '';
 
-function say(text, dur = 3.4, force = false) {
-  if (force) {
-    S.capQueue.length = 0;
-    S.capTimer = 0;
-    captionEl.classList.remove('on');
+const CAP_MIN = 2.5;      // каждая подпись видна не меньше 2.5 с независимо от новых
+const CAP_QUEUE_MAX = 3;  // больше не копим: важное вытесняет мелочь
+
+function say(text, dur = 3.4, important = false) {
+  const item = { text, dur: Math.max(CAP_MIN, dur), prio: important ? 2 : 1 };
+  if (S.capQueue.length >= CAP_QUEUE_MAX) {
+    let lowIdx = -1;
+    for (let i = S.capQueue.length - 1; i >= 0; i--) {
+      if (S.capQueue[i].prio === 1) { lowIdx = i; break; }
+    }
+    if (item.prio === 2) {
+      // важное вытесняет мелочь, иначе самую старую
+      if (lowIdx >= 0) S.capQueue.splice(lowIdx, 1);
+      else S.capQueue.shift();
+    } else {
+      // мелочь клеим к последней мелочи, а если её нет — выбрасываем
+      const last = S.capQueue[S.capQueue.length - 1];
+      if (last.prio === 1) {
+        last.text += '\n' + text;
+        last.dur = Math.max(last.dur, item.dur);
+      }
+      return;
+    }
   }
-  if (S.capQueue.length > 2) S.capQueue.shift();
-  S.capQueue.push({ text, dur });
+  S.capQueue.push(item);
+}
+
+function showNextCaption() {
+  const c = S.capQueue.shift();
+  captionEl.textContent = c.text;
+  captionEl.classList.add('on');
+  S.capTimer = c.dur;
 }
 
 function tickCaptions(dt) {
   if (S.capTimer > 0) {
     S.capTimer -= dt;
-    if (S.capTimer <= 0) captionEl.classList.remove('on');
+    if (S.capTimer > 0) return;
+    S.capTimer = 0;
+    if (S.capQueue.length) showNextCaption();
+    else captionEl.classList.remove('on');
   } else if (S.capQueue.length) {
-    const c = S.capQueue.shift();
-    captionEl.textContent = c.text;
-    captionEl.classList.add('on');
-    S.capTimer = c.dur;
+    showNextCaption();
+  }
+}
+
+/* подсказка управления живёт только до первого реального ввода */
+function showControlHint() {
+  if (S.hintUsed || S.phase !== 'play') return;
+  S.controlHintOn = true;
+  subEl.textContent = IS_COARSE() ? 'руль — половины экрана · тормоз — держи низ' : '← → руль · ↓ тормоз';
+  subEl.classList.add('on');
+}
+
+function markControlUsed() {
+  if (S.hintUsed) return;
+  S.hintUsed = true;
+  if (S.controlHintOn) {
+    S.controlHintOn = false;
+    subEl.classList.remove('on');
+    subEl.textContent = '';
   }
 }
 
@@ -1609,6 +1715,10 @@ function updateHUD() {
     invertEl.classList.remove('on');
   }
   if (warnEl) warnEl.classList.toggle('on', S.warnT > 0);
+  if (brakepadEl) {
+    brakepadEl.classList.toggle('on', S.phase === 'play');
+    brakepadEl.classList.toggle('braking', S.phase === 'play' && !!S.braking);
+  }
   if (turnEl) {
     turnEl.classList.toggle('on', S.turnT > 0);
     if (S.curvNow !== undefined && S.turnT > 0) {
@@ -1628,6 +1738,8 @@ const OB_BAG = ['pothole', 'brick', 'manhole', 'puddle', 'chickens', 'hump', 'gr
 function spawnObstacles(fromP, toP) {
   let p = fromP + 150;
   while (p < toP - 140) {
+    // не ставим препятствие в точку, где невеста выбегает на дорогу
+    if (Math.abs(p - BRIDE_P) < 220) p += 240;
     const type = OB_BAG[obCycle % OB_BAG.length];
     obCycle++;
     const meta = OB_META[type];
@@ -1672,18 +1784,25 @@ function buildSegYard() {
   const start = SEGMENTS[0].start;
 
   const cow = makeCow();
-  cow.position.set(worldX(start + 1650, LANES[0]), 0, -(start + 1650));
+  cow.position.set(worldX(COW_P, LANES[0]), 0, -COW_P);
   cow.rotation.y = -0.375;
   dynGroup.add(cow);
   colliders.push({ obj: cow, hw: 1.1, hl: 1.5, kind: 'cow' });
   E.cow = cow;
 
   const mow = makeLawnmower();
-  mow.position.set(worldX(start + 3300, -(ROAD_HALF + 1.5)), 0, -(start + 3300));
+  mow.position.set(worldX(MOWER_P, -(ROAD_HALF + 1.5)), 0, -MOWER_P);
   mow.rotation.y = Math.PI;
   dynGroup.add(mow);
   colliders.push({ obj: mow, hw: 1.0, hl: 1.3, kind: 'mower' });
   E.mower = { obj: mow, arm: mow.userData.armR, z: mow.position.z };
+
+  // невеста голосует уже в первом отрезке — в первой трети маршрута
+  const bride = makeBride();
+  bride.position.set(worldX(BRIDE_P, 7.6), 0, -BRIDE_P);
+  bride.rotation.y = Math.PI / 2;
+  dynGroup.add(bride);
+  E.bride = { obj: bride, state: 'wait', z: bride.position.z, t: 0 };
 
   // велосипед у забора
   const bike = new THREE.Group();
@@ -1694,20 +1813,13 @@ function buildSegYard() {
     bike.add(w);
   }
   box(bike, 0.08, 0.08, 0.9, 0x8a3a3a, 0, 0.62, 0);
-  bike.position.set(worldX(start + 700, -7.4), 0, -(start + 700));
+  bike.position.set(worldX(start + 430, -7.4), 0, -(start + 430));
   dynGroup.add(bike);
 }
 
 /* ---------- 2. ШОССЕ ---------- */
 function buildSegHighway() {
   const start = SEGMENTS[1].start;
-
-  // девушка в свадебном платье
-  const bride = makeBride();
-  bride.position.set(worldX(start + 1500, 7.6), 0, -(start + 1500));
-  bride.rotation.y = Math.PI / 2;
-  dynGroup.add(bride);
-  E.bride = { obj: bride, state: 'wait', z: bride.position.z, t: 0 };
 
   // голубь
   const pigeon = makePigeon();
@@ -1722,7 +1834,7 @@ function buildSegHighway() {
     c.position.set(-4.4 + i * 0.9, 0.3, -i * 1.2);
     cone.add(c);
   }
-  cone.position.set(worldX(start + 300, 0), 0, -(start + 300));
+  cone.position.set(worldX(start + 200, 0), 0, -(start + 200));
   dynGroup.add(cone);
 }
 
@@ -1732,16 +1844,16 @@ function buildSegCity() {
 
   // трактор
   const tractor = makeTractor();
-  tractor.position.set(worldX(start + 800, LANES[2]), 0, -(start + 800));
+  tractor.position.set(worldX(start + 470, LANES[2]), 0, -(start + 470));
   dynGroup.add(tractor);
   colliders.push({ obj: tractor, hw: 1.5, hl: 2.3, kind: 'tractor' });
   E.tractor = tractor;
 
   // похороны
-  const funeralZ = -(start + 3415);
+  const funeralZ = -CITY_FUNERAL_P;
   const fg = new THREE.Group();
   fg.position.z = funeralZ;
-  fg.position.x = roadOff(start + 3415);
+  fg.position.x = roadOff(CITY_FUNERAL_P);
   const mourners = [];
   const xs = [-3.6, -1.3, 1.0, 3.4];
   for (let i = 0; i < xs.length; i++) {
@@ -1775,8 +1887,8 @@ function buildSegCity() {
   E.funeral = {
     group: fg,
     z: funeralZ,
-    zoneStart: start + 3380,
-    zoneEnd: start + 3760,
+    zoneStart: CITY_FUNERAL_P - 35,
+    zoneEnd: CITY_FUNERAL_P + 345,
     stopped: 0,
     done: false,
     paid: false,
@@ -1785,14 +1897,14 @@ function buildSegCity() {
 
   // перекрёсток: полосы перехода
   for (let i = 0; i < 7; i++) {
-    const cx = worldX(start + 3415, -4.2 + i * 1.4);
+    const cx = worldX(CITY_FUNERAL_P, -4.2 + i * 1.4);
     box(dynGroup, 1.0, 0.02, 0.5, PAL.cream, cx, 0.03, funeralZ + 4.2);
     box(dynGroup, 1.0, 0.02, 0.5, PAL.cream, cx, 0.03, funeralZ - 4.2);
   }
 
   // инспектор
   const insp = makePerson({ shirt: 0x2f3a4a, pants: 0x22262e, hair: 0x2a2a2a, hat: 0x2f3a4a, scale: 1.05 });
-  insp.position.set(worldX(start + 6100, -7.2), 0, -(start + 6100));
+  insp.position.set(worldX(CITY_INSPECTOR_P, -7.2), 0, -CITY_INSPECTOR_P);
   insp.rotation.y = -Math.PI / 2;
   // жезл
   const baton = box(insp, 0.06, 0.5, 0.06, 0xe6e2d8, 0.34, 1.1, -0.3);
@@ -1805,23 +1917,24 @@ function buildSegCity() {
    УПРАВЛЕНИЕ
    ===================================================================== */
 
-const held = { left: false, right: false, brake: false };
-const pointers = new Set();
+const held = { left: false, right: false, keyBrake: false };
+const pointerRoles = new Map(); // pointerId -> { kind: 'steer'|'brake', side, downAt }
+const BRAKE_ZONE = 0.75;        // нижняя четверть экрана — тормоз
+const BRAKE_DELAY_MS = 120;     // короткий тап не тормозит
 
-/* тап — короткий импульс руля; удержание — ускорение, см. updatePlay */
 function tapSteer(dir) {
   if (S.phase !== 'play') return;
+  markControlUsed();
   if (S.invert > 0) dir = -dir;
   S.latV = clamp(S.latV + dir * 7.5, -12, 12);
 }
 
 function setKey(code, down) {
-  const wasBrake = held.brake;
   if (code === 'ArrowLeft' || code === 'KeyA') held.left = down;
   else if (code === 'ArrowRight' || code === 'KeyD') held.right = down;
-  else if (code === 'ArrowDown' || code === 'KeyS') held.brake = down;
+  else if (code === 'ArrowDown' || code === 'KeyS') held.keyBrake = down;
   else return false;
-  if (held.brake && !wasBrake) S.speed = Math.min(S.speed, SPEED_MAX);
+  if (down && S.phase === 'play') markControlUsed();
   return true;
 }
 
@@ -1843,42 +1956,53 @@ window.addEventListener('keyup', (e) => {
 });
 
 window.addEventListener('blur', () => {
-  held.left = held.right = held.brake = false;
-  pointers.clear();
-  pointerSides.clear();
+  held.left = held.right = held.keyBrake = false;
+  pointerRoles.clear();
 });
 
-const pointerSides = new Map();
+function touchSteer() {
+  let left = false;
+  let right = false;
+  for (const r of pointerRoles.values()) {
+    if (r.kind !== 'steer') continue;
+    if (r.side < 0) left = true;
+    else right = true;
+  }
+  return { left, right };
+}
 
-function syncPointerHeld() {
-  const sides = new Set(pointerSides.values());
-  held.left = sides.has(-1);
-  held.right = sides.has(1);
-  held.brake = pointerSides.size >= 2;
+function touchBrakeActive() {
+  const now = performance.now();
+  let steerFingers = 0;
+  for (const r of pointerRoles.values()) {
+    if (r.kind === 'brake' && now - r.downAt > BRAKE_DELAY_MS) return true;
+    if (r.kind === 'steer') steerFingers++;
+  }
+  // два пальца по экрану — дубль тормоза
+  return steerFingers >= 2;
 }
 
 viewEl.addEventListener('pointerdown', (e) => {
   if (S.phase !== 'play') return;
   e.preventDefault();
-  pointers.add(e.pointerId);
-  if (pointers.size >= 2) {
-    syncPointerHeld();
+  markControlUsed();
+  if (e.clientY / Math.max(1, window.innerHeight) > BRAKE_ZONE) {
+    pointerRoles.set(e.pointerId, { kind: 'brake', downAt: performance.now() });
     return;
   }
   const side = e.clientX < window.innerWidth / 2 ? -1 : 1;
-  pointerSides.set(e.pointerId, side);
-  syncPointerHeld();
+  pointerRoles.set(e.pointerId, { kind: 'steer', side, downAt: performance.now() });
   tapSteer(side);
 }, { passive: false });
 
 function releasePointer(e) {
-  pointers.delete(e.pointerId);
-  pointerSides.delete(e.pointerId);
-  syncPointerHeld();
+  pointerRoles.delete(e.pointerId);
 }
 viewEl.addEventListener('pointerup', releasePointer);
 viewEl.addEventListener('pointercancel', releasePointer);
 viewEl.addEventListener('pointerleave', releasePointer);
+window.addEventListener('pointerup', releasePointer);
+window.addEventListener('pointercancel', releasePointer);
 viewEl.addEventListener('contextmenu', (e) => e.preventDefault());
 
 /* =====================================================================
@@ -2006,15 +2130,20 @@ function updatePlay(dt) {
   const t = S.time;
 
   /* --- скорость --- */
-  const want = held.brake ? 0 : SPEED_MAX;
-  S.speed = damp(S.speed, want, held.brake ? 6 : 1.6, dt);
+  const touch = touchSteer();
+  const braking = held.keyBrake || touchBrakeActive();
+  S.braking = braking;
+  const want = braking ? 0 : SPEED_MAX;
+  // быстрый разгон: с 0 до максимума примерно за 1.3 секунды
+  S.speed = damp(S.speed, want, braking ? 8 : 3.0, dt);
   if (S.slowT > 0) {
     S.slowT -= dt;
     S.speed = Math.min(S.speed, SPEED_MAX * 0.55);
   }
 
   /* --- руль: непрерывное латеральное смещение --- */
-  let dir = (held.left ? -1 : 0) + (held.right ? 1 : 0);
+  let dir = (held.left ? -1 : 0) + (held.right ? 1 : 0) + (touch.left ? -1 : 0) + (touch.right ? 1 : 0);
+  dir = clamp(dir, -1, 1);
   if (S.invert > 0) dir = -dir;
   const grip = S.slip > 0 ? 0.32 : 1;
   const curv = roadCurv(S.p);
@@ -2117,21 +2246,13 @@ function updatePlay(dt) {
 
   /* --- счётчики --- */
   if (S.invuln > 0) S.invuln -= dt;
-  if (S.hintT > 0) {
-    S.hintT -= dt;
-    if (S.hintT <= 0) subEl.classList.remove('on');
-  }
-
   /* --- отрезки / чекпоинты --- */
   if (S.seg < SEGMENTS.length - 1 && S.p >= SEGMENTS[S.seg + 1].start) {
     S.seg += 1;
     S.checkpoint = { p: S.p, clock: S.clock, mood: S.mood, seg: S.seg };
     buildSegment(S.seg);
     say(`ЧЕКПОИНТ · Отрезок ${S.seg + 1}: ${SEGMENTS[S.seg].name}`, 3.2);
-    if (S.seg === 1) {
-      subEl.textContent = '← → руль · ↓ тормоз';
-      subEl.classList.add('on');
-    }
+    showControlHint();
   }
 
   /* --- объекты отрезка --- */
@@ -2155,8 +2276,11 @@ function updatePlay(dt) {
     return;
   }
 
-  /* --- победа --- */
-  if (S.p >= ROUTE) win();
+  /* --- победа: доехать мало, нужно ещё не быть злым --- */
+  if (S.p >= ROUTE) {
+    if (S.mood >= MOOD_WIN) win();
+    else moodFail();
+  }
 }
 
 function updateSegmentObjects(dt) {
@@ -2176,7 +2300,7 @@ function updateSegmentObjects(dt) {
 
   if (E.bride) {
     const b = E.bride;
-    if (b.state === 'wait' && S.p > SEGMENTS[1].start + 1470) {
+    if (b.state === 'wait' && S.p > BRIDE_P - 60) {
       b.state = 'run';
       b.t = 0;
       say('Девушка в свадебном платье голосует.\nОна не сомневается.', 3.8);
@@ -2199,7 +2323,7 @@ function updateSegmentObjects(dt) {
 
   if (E.pigeon) {
     const p = E.pigeon;
-    if (p.state === 'hidden' && S.p > SEGMENTS[1].start + 4500) {
+    if (p.state === 'hidden' && S.p > HIGHWAY_PIGEON_P) {
       p.state = 'fly';
       p.f = 0;
       p.obj.visible = true;
@@ -2261,6 +2385,7 @@ function updateSegmentObjects(dt) {
       }
     }
     if (S.p > f.zoneStart && S.p < f.zoneEnd && !f.done) {
+      S.controlHintOn = false;
       subEl.textContent = `СТОЯТЬ: ${clamp(2 - f.stopped, 0, 2).toFixed(1)} / 2.0`;
       subEl.classList.add('on');
     } else if (!f.done && S.p < f.zoneStart - 80 && S.p > f.zoneStart - 700) {
@@ -2278,7 +2403,7 @@ function updateSegmentObjects(dt) {
 
   if (E.inspector) {
     const ins = E.inspector;
-    if (!ins.talked && S.p > SEGMENTS[2].start + 6050) {
+    if (!ins.talked && S.p > CITY_INSPECTOR_P - 50) {
       ins.talked = true;
       ins.arm.rotation.x = 2.2;
       say('— А вы вообще куда?\n— На день рождения.\n— Тогда счастливо. И не гоните.', 5.5, true);
@@ -2312,7 +2437,8 @@ function lose() {
   if (S.phase !== 'play') return;
   S.phase = 'lost';
   S.clock = CLOCK_MAX;
-  held.brake = true;
+  held.keyBrake = true;
+  pointerRoles.clear();
   document.getElementById('overtitle').textContent = '19:00';
   document.getElementById('oversub').textContent = 'приехали без тебя';
   document.getElementById('overtext').textContent =
@@ -2324,12 +2450,31 @@ function lose() {
   captionEl.classList.remove('on');
 }
 
+function moodFail() {
+  if (S.phase !== 'play') return;
+  S.phase = 'lost';
+  held.keyBrake = true;
+  pointerRoles.clear();
+  S.capQueue.length = 0;
+  S.capTimer = 0;
+  captionEl.classList.remove('on');
+  const pct = Math.round(S.mood);
+  document.getElementById('overtitle').textContent = 'ДОЕХАЛ';
+  document.getElementById('oversub').textContent = 'но злой';
+  document.getElementById('overtext').textContent =
+    `Настроение ${pct}% — меньше ${MOOD_WIN}%. Торт не помог: ` +
+    'во дворе тебя встретили, а ты только ругался.\n' +
+    `Переиграй отрезок ${S.seg + 1}: ${SEGMENTS[S.seg].name} — и довези хорошее настроение.`;
+  document.getElementById('retry').textContent = `с начала отрезка ${S.seg + 1}`;
+  overEl.classList.remove('hidden');
+}
+
 function win() {
   if (S.phase !== 'play') return;
   S.phase = 'finale';
   S.finaleT = 0;
   S.winClock = Math.min(S.clock, CLOCK_MAX);
-  S.hintT = 0;
+  S.controlHintOn = false;
   subEl.classList.remove('on');
   S.capQueue.length = 0;
   S.capTimer = 0;
@@ -2423,6 +2568,7 @@ function updateFinale(dt) {
     document.getElementById('wonsub').textContent = 'Торт был у них.';
     document.getElementById('wontext').textContent =
       `Ты доехал в ${fmtClock(S.winClock).slice(0, 5)}. ` +
+      `Настроение ${Math.round(S.mood)}% — выше порога ${MOOD_WIN}%. ` +
       'Полиция обогнала тебя у самого двора и перекрыла въезд.\n' +
       'В багажнике — торт. Девушка в свадебном платье и голубь тоже здесь.\n' +
       'С днём рождения.';
@@ -2445,8 +2591,8 @@ function resetPlayer() {
   playerBody.position.set(0, 0, 0);
   playerBody.rotation.set(0, 0, 0);
   held.left = held.right = false;
-  held.brake = false;
-  pointers.clear();
+  held.keyBrake = false;
+  pointerRoles.clear();
 }
 
 function buildFinaleProps() {
@@ -2506,7 +2652,6 @@ function startRun(fromStart) {
   S.shake = 0;
   S.slowT = 0;
   S.invert = 0;
-  S.hintT = 22;
   S.finaleT = 0;
   S.capQueue.length = 0;
   S.capTimer = 0;
@@ -2516,14 +2661,13 @@ function startRun(fromStart) {
   buildSegment(S.seg);
   police.position.set(S.x * 0.9, 0, -S.p + 8.8);
   police.rotation.y = 0;
-  camLook.set(S.x * 0.9, 1, -S.p - 21);
+  camLook.set(S.x * 0.9, 1, -S.p - CAM_LOOKAHEAD);
   camYawNow = CAM_YAW + roadHead(S.p) * 0.8;
   startEl.classList.add('hidden');
   overEl.classList.add('hidden');
   wonEl.classList.add('hidden');
   wonEl.classList.remove('show');
-  subEl.textContent = '← → руль · ↓ тормоз · пробел — старт';
-  subEl.classList.add('on');
+  showControlHint();
   segEl.textContent = '';
   lastSegText = '';
   if (S.seg === 0) {
@@ -2550,15 +2694,13 @@ function retrySegment() {
   resetPlayer();
   buildSegment(S.seg);
   police.position.set(S.x * 0.9, 0, -S.p + 8.8);
-  camLook.set(S.x * 0.9, 1, -S.p - 21);
+  camLook.set(S.x * 0.9, 1, -S.p - CAM_LOOKAHEAD);
   camYawNow = CAM_YAW + roadHead(S.p) * 0.8;
   S.capQueue.length = 0;
   S.capTimer = 0;
   captionEl.classList.remove('on');
   overEl.classList.add('hidden');
-  subEl.textContent = '← → руль · ↓ тормоз';
-  subEl.classList.add('on');
-  S.hintT = 8;
+  showControlHint();
   say(`Отрезок ${S.seg + 1}: ${SEGMENTS[S.seg].name}. Ещё раз.`, 3.4);
 }
 
@@ -2602,7 +2744,7 @@ function step(dt) {
 
   // камера
   if (S.phase === 'play' || S.phase === 'lost') {
-    const look = new THREE.Vector3(S.x * 0.9, 1.0, -S.p - 21);
+    const look = new THREE.Vector3(S.x * 0.9, 1.0, -S.p - CAM_LOOKAHEAD);
     camLook.lerp(look, 1 - Math.exp(-5.5 * dt));
   }
   const headNow = (S.phase === 'play' || S.phase === 'lost') ? roadHead(S.p) : 0;
@@ -2644,11 +2786,84 @@ document.getElementById('loading').textContent = 'три.js на месте · �
 
 /* отладка для проверки (не мешает игре) */
 window.__game = {
-  S, scene, camera, renderer, LANES, ROUTE, police, playerCar,
+  S, scene, camera, renderer, LANES, ROUTE, MOOD_WIN, police, playerCar,
   get phase() { return S.phase; },
   start: () => startRun(true),
+  snapCamera: () => {
+    camLook.set(S.x * 0.9, 1, -S.p - CAM_LOOKAHEAD);
+    camYawNow = CAM_YAW + roadHead(S.p) * 0.8;
+    camera.position.copy(camLook).add(camOffsetFor(camYawNow));
+    camera.lookAt(camLook);
+  },
   forceWin: () => { S.p = ROUTE; },
   forceLose: () => { S.clock = CLOCK_MAX - 0.2; },
+  setMood: (v) => { S.mood = clamp(v, 0, 100); },
+  moodFailNow: () => { S.mood = Math.min(S.mood, MOOD_WIN - 1); S.p = ROUTE - 2; },
+  layout: () => ({ VIEW_SPAN, CAM_LOOKAHEAD, w: window.innerWidth, h: window.innerHeight }),
+  captionInfo: () => ({
+    visible: captionEl.classList.contains('on'),
+    text: captionEl.textContent,
+    rect: (() => { const r = captionEl.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })(),
+    timer: S.capTimer,
+    queue: S.capQueue.map((c) => c.text),
+  }),
+  say: (text, dur, important) => say(text, dur, important),
+  brideInfo: () => E.bride ? {
+    state: E.bride.state,
+    seat: brideSeat.visible,
+    p: +S.p.toFixed(0),
+    t: +S.time.toFixed(1),
+    x: +E.bride.obj.position.x.toFixed(1),
+    z: +E.bride.obj.position.z.toFixed(1),
+    screen: window.__game.project(E.bride.obj.position.x, 1.2, E.bride.obj.position.z),
+    onScreen: window.__game.onScreen(E.bride.obj.position.x, 1.2, E.bride.obj.position.z),
+  } : null,
+  hudRects: () => {
+    const ids = ['mood', 'clockbox', 'speed', 'seg', 'turn', 'warn', 'invert', 'brakepad'];
+    const out = {};
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      out[id] = { x: r.x, y: r.y, w: r.width, h: r.height, shown: getComputedStyle(el).display !== 'none' && r.width > 0 };
+    }
+    return out;
+  },
+  playerRect: () => {
+    const pts = [];
+    const car = playerCar;
+    car.updateMatrixWorld(true);
+    car.traverse((o) => {
+      if (!o.isMesh || !o.geometry) return;
+      o.geometry.computeBoundingBox();
+      const bb = o.geometry.boundingBox;
+      const V = o.position.constructor;
+      const cs = [
+        [bb.min.x, bb.min.y, bb.min.z], [bb.min.x, bb.min.y, bb.max.z],
+        [bb.min.x, bb.max.y, bb.min.z], [bb.min.x, bb.max.y, bb.max.z],
+        [bb.max.x, bb.min.y, bb.min.z], [bb.max.x, bb.min.y, bb.max.z],
+        [bb.max.x, bb.max.y, bb.min.z], [bb.max.x, bb.max.y, bb.max.z],
+      ];
+      for (const c of cs) {
+        const v = new V(c[0], c[1], c[2]);
+        o.localToWorld(v);
+        v.project(camera);
+        pts.push([(v.x * 0.5 + 0.5) * window.innerWidth, (-v.y * 0.5 + 0.5) * window.innerHeight]);
+      }
+    });
+    const xs = pts.map((q) => q[0]);
+    const ys = pts.map((q) => q[1]);
+    const x = Math.min(...xs), y = Math.min(...ys);
+    return { x, y, w: Math.max(...xs) - x, h: Math.max(...ys) - y };
+  },
+  crossingInfo: () => {
+    let best = null;
+    for (const c of crossings) {
+      const d = c.p - S.p;
+      if (d > -5 && (best === null || d < best.d)) best = { d, kind: c.kind.id, started: c.started, veh: c.veh.visible, onScreen: c.veh.visible ? window.__game.onScreen(c.veh.position.x, 1.0, c.veh.position.z) : false };
+    }
+    return best;
+  },
   skipTo: (seg) => {
     S.seg = seg;
     S.p = SEGMENTS[seg].start + 1;
