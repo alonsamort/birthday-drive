@@ -1616,6 +1616,40 @@ const audio = (() => {
   const MUSIC_LEVEL = 0.22;
   const SFX_LEVEL = 0.62;
   const MASTER_LEVEL = 1;
+  const BAR_STEPS = 16;
+  const DUCK_DB = -3.5;             // музыка под салютом: 3–4 дБ вниз
+
+  // слои бита: каждый живёт в своей шине, чтобы мерить вклад соло
+  const LAYERS = [
+    'kick', 'snare', 'clap', 'hatClosed', 'hatOpen', 'shaker',
+    'rim', 'tom', 'bass', 'stab', 'hook', 'crash', 'pad',
+  ];
+  const BASS_ROOTS = [82.41, 82.41, 98.0, 73.42];   // E2 E2 G2 D2
+  const HOOK_A = [
+    [0, 659.25, 0.16, 1], [3, 783.99, 0.14, 0.82], [6, 880.0, 0.12, 0.7],
+    [8, 659.25, 0.16, 0.95], [11, 587.33, 0.12, 0.72], [14, 783.99, 0.2, 0.85],
+  ];
+  const HOOK_B = [
+    [0, 659.25, 0.16, 1], [3, 880.0, 0.14, 0.82], [6, 987.77, 0.12, 0.7],
+    [8, 783.99, 0.16, 0.95], [11, 987.77, 0.12, 0.7], [14, 659.25, 0.22, 0.85],
+  ];
+  const KICK_A = [0, 3, 8, 11, 14];      // полный такт
+  const KICK_B = [0, 3, 7, 8, 11, 14];
+  const KICK_A_SPARSE = [0, 8, 14];      // соседний такт — разреженный
+  const KICK_B_SPARSE = [0, 8, 14];
+  // бас: [шаг, множитель к корню, длительность, громкость] — 2–3 ноты на такт
+  const BASS_A = [
+    [[0, 1, 0.26, 1], [3, 1, 0.12, 0.7], [8, 1, 0.22, 0.95], [11, 1.5, 0.14, 0.7], [14, 2, 0.12, 0.6]],
+    [[0, 1, 0.2, 0.95], [6, 1.5, 0.16, 0.8], [8, 1, 0.24, 0.9], [13, 2, 0.12, 0.6]],
+    [[0, 1, 0.24, 1], [3, 1.5, 0.12, 0.7], [8, 1, 0.2, 0.9], [10, 2, 0.12, 0.65], [14, 1.5, 0.14, 0.7]],
+    [[0, 1, 0.22, 0.95], [5, 1.5, 0.14, 0.75], [8, 2, 0.16, 0.75], [12, 1, 0.18, 0.85], [15, 1.5, 0.1, 0.6]],
+  ];
+  const BASS_B = [
+    [[0, 1, 0.26, 1], [3, 2, 0.1, 0.65], [7, 1.5, 0.14, 0.75], [8, 1, 0.22, 0.9], [14, 2, 0.12, 0.6]],
+    [[0, 1, 0.2, 0.95], [4, 1.5, 0.12, 0.7], [8, 1, 0.22, 0.9], [11, 2, 0.12, 0.6], [14, 1.5, 0.14, 0.65]],
+    [[0, 1, 0.24, 1], [6, 1.5, 0.16, 0.8], [8, 2, 0.18, 0.8], [12, 1, 0.16, 0.75]],
+    [[0, 1, 0.2, 0.9], [2, 1.5, 0.12, 0.65], [8, 1.5, 0.18, 0.8], [10, 1, 0.16, 0.8], [14, 2, 0.12, 0.6]],
+  ];
 
   let ctx = null;
   let master = null;
@@ -1623,7 +1657,6 @@ const audio = (() => {
   let analyser = null;
   let music = null;
   let sfx = null;
-  let noise = null;
   let buf = null;
   let started = false;
   let step = 0;
@@ -1632,6 +1665,10 @@ const audio = (() => {
   let muted = false;
   let sirenUntil = 0;
   let timer = null;
+  let LIVE = null;               // движок живого графа {ctx, music, sfx, buses, noise}
+  let duckUntil = 0;
+  let duckDb = 0;
+  let lastFireworkDur = 0;
 
   // состояние разблокировки: диагностика и честный индикатор
   let contextCount = 0;
@@ -1723,42 +1760,73 @@ const audio = (() => {
     comp.connect(analyser);
     analyser.connect(ctx.destination);
 
-    // один буфер шума на все хэты, снейры и краши
-    const n = Math.floor(ctx.sampleRate * 2);
-    const b = ctx.createBuffer(1, n, ctx.sampleRate);
+    LIVE = {
+      ctx,
+      music,
+      sfx,
+      buses: buildBuses(ctx, music, null),
+      noise: makeNoise(ctx),
+      seg: null,
+    };
+    buildPad(LIVE);
+    return ctx;
+  }
+
+  function makeNoise(c) {
+    // один буфер шума на все хэты, клэпы и салют
+    const n = Math.floor(c.sampleRate * 2);
+    const b = c.createBuffer(1, n, c.sampleRate);
     const d = b.getChannelData(0);
     for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
-    noise = b;
+    return b;
+  }
 
-    // тихий непрерывный пад: музыка не проваливается в ноль между ударами
-    const lp = ctx.createBiquadFilter();
+  function buildBuses(c, dest, solo) {
+    const out = {};
+    for (const name of LAYERS) {
+      const g = c.createGain();
+      // соло-замер глушит всё, кроме одного слоя
+      g.gain.value = solo && solo !== name ? 0 : 1;
+      g.connect(dest);
+      out[name] = g;
+    }
+    return out;
+  }
+
+  function outOf(en, name) {
+    return (en.buses && en.buses[name]) || en.music;
+  }
+
+  function buildPad(en) {
+    const c = en.ctx;
+    const lp = c.createBiquadFilter();
     lp.type = 'lowpass';
-    lp.frequency.value = 1100;
+    lp.frequency.value = 1300;
     lp.Q.value = 0.4;
-    const pad = ctx.createGain();
-    pad.gain.value = 0.13;
-    const lfo = ctx.createOscillator();
+    const pad = c.createGain();
+    pad.gain.value = 0.07;
+    const lfo = c.createOscillator();
     lfo.type = 'sine';
     lfo.frequency.value = 0.11;
-    const lfoG = ctx.createGain();
-    lfoG.gain.value = 0.01;
+    const lfoG = c.createGain();
+    lfoG.gain.value = 0.008;
     lfo.connect(lfoG);
     lfoG.connect(pad.gain);
     lp.connect(pad);
-    pad.connect(music);
+    pad.connect(outOf(en, 'pad'));
     for (const f of [220, 261.63, 329.63]) {
-      const o = ctx.createOscillator();
+      const o = c.createOscillator();
       o.type = 'triangle';
       o.frequency.value = f;
-      const og = ctx.createGain();
+      const og = c.createGain();
       og.gain.value = 0.34;
       o.connect(og);
       og.connect(lp);
       o.start();
     }
     lfo.start();
-    return ctx;
   }
+
 
   function resumeSync() {
     if (!ctx || ctx.state === 'running') return null;
@@ -1932,156 +2000,238 @@ const audio = (() => {
     };
   }
 
-  /* ---------- ударные ---------- */
+  /* ---------- ударные и слои ---------- */
 
-  function kick(t, vel = 1) {
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = 'sine';
-    o.frequency.setValueAtTime(120, t);
-    o.frequency.exponentialRampToValueAtTime(50, t + 0.11);
+  // общий шумовой удар: фильтры + огибающая, всё в шину слоя
+  function noiseBurst(en, layer, t, opts) {
+    const c = en.ctx;
+    const src = c.createBufferSource();
+    src.buffer = en.noise;
+    const chain = [src];
+    let node = src;
+    if (opts.hp) {
+      const f = c.createBiquadFilter();
+      f.type = 'highpass';
+      f.frequency.value = opts.hp;
+      f.Q.value = opts.hpQ || 0.7;
+      node.connect(f);
+      node = f;
+      chain.push(f);
+    }
+    if (opts.bp) {
+      const f = c.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.value = opts.bp;
+      f.Q.value = opts.bpQ || 0.9;
+      node.connect(f);
+      node = f;
+      chain.push(f);
+    }
+    if (opts.pk) {
+      const f = c.createBiquadFilter();
+      f.type = 'peaking';
+      f.frequency.value = opts.pk;
+      f.Q.value = opts.pkQ || 1;
+      f.gain.value = opts.pkGain || 8;
+      node.connect(f);
+      node = f;
+      chain.push(f);
+    }
+    const g = c.createGain();
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(0.9 * vel, t + 0.004);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+    g.gain.linearRampToValueAtTime(opts.peak, t + (opts.attack || 0.003));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + opts.dur);
+    node.connect(g);
+    g.connect(opts.dest || outOf(en, layer));
+    chain.push(g);
+    src.start(t, Math.random() * 0.4);
+    src.stop(t + opts.dur + 0.02);
+    src.onended = dispose(chain);
+  }
+
+  function tone(en, layer, t, type, f0, f1, peak, dur, attack = 0.004) {
+    const c = en.ctx;
+    const o = c.createOscillator();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    if (f1 && f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.7);
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(peak, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.connect(g);
-    g.connect(music);
+    g.connect(outOf(en, layer));
     o.start(t);
-    o.stop(t + 0.28);
+    o.stop(t + dur + 0.02);
     o.onended = dispose([o, g]);
-
-    // щелчок по верхушке — бочка читается даже на телефоне
-    const n = ctx.createBufferSource();
-    n.buffer = noise;
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 1500;
-    const ng = ctx.createGain();
-    ng.gain.setValueAtTime(0.12 * vel, t);
-    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.03);
-    n.connect(hp);
-    hp.connect(ng);
-    ng.connect(music);
-    n.start(t);
-    n.stop(t + 0.04);
-    n.onended = dispose([n, hp, ng]);
+    return o;
   }
 
-  function snare(t, vel = 1, ghost = false) {
-    const n = ctx.createBufferSource();
-    n.buffer = noise;
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 650;
-    const bp = ctx.createBiquadFilter();
-    bp.type = 'bandpass';
-    bp.frequency.value = 1900;
-    bp.Q.value = 0.9;
-    const g = ctx.createGain();
-    const peak = (ghost ? 0.16 : 0.5) * vel;
-    const dur = ghost ? 0.09 : 0.2;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(peak, t + 0.004);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    n.connect(hp);
-    hp.connect(bp);
-    bp.connect(g);
-    g.connect(music);
-    n.start(t);
-    n.stop(t + dur + 0.03);
-    n.onended = dispose([n, hp, bp, g]);
-
-    const o = ctx.createOscillator();
-    o.type = 'triangle';
-    o.frequency.setValueAtTime(190, t);
-    o.frequency.exponentialRampToValueAtTime(120, t + 0.07);
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(0.0001, t);
-    og.gain.linearRampToValueAtTime((ghost ? 0.04 : 0.15) * vel, t + 0.004);
-    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
-    o.connect(og);
-    og.connect(music);
-    o.start(t);
-    o.stop(t + 0.13);
-    o.onended = dispose([o, og]);
+  function skipLayer(en, name) {
+    return !!(en.solo && en.solo !== name);
   }
 
-  function hat(t, vel = 1, open = false) {
-    const n = ctx.createBufferSource();
-    n.buffer = noise;
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 7200;
-    hp.Q.value = 0.7;
-    const g = ctx.createGain();
-    const dur = open ? 0.16 : 0.045;
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime((open ? 0.15 : 0.19) * vel, t + 0.002);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    n.connect(hp);
-    hp.connect(g);
-    g.connect(music);
-    n.start(t);
-    n.stop(t + dur + 0.02);
-    n.onended = dispose([n, hp, g]);
+  function kick(en, t, vel = 1) {
+    if (skipLayer(en, 'kick')) return;
+    // тело 240→180 Гц — то, что реально слышно на телефоне
+    tone(en, 'kick', t, 'sine', 240, 180, 0.58 * vel, 0.16, 0.003);
+    // саб для больших колонок, на телефоне почти не слышен — не основной
+    tone(en, 'kick', t, 'sine', 105, 58, 0.3 * vel, 0.24, 0.006);
+    // панч 1–2 кГц: атака бочки на маленьком динамике
+    noiseBurst(en, 'kick', t, { hp: 1100, bp: 1900, bpQ: 0.8, peak: 0.3 * vel, dur: 0.035 });
   }
 
-  function bass(t, freq, dur = 0.14, vel = 1) {
-    const o = ctx.createOscillator();
-    o.type = 'sawtooth';
-    o.frequency.setValueAtTime(freq, t);
-    const lp = ctx.createBiquadFilter();
+  function snare(en, t, vel = 1, ghost = false) {
+    if (skipLayer(en, 'snare')) return;
+    const k = ghost ? 0.42 : 1;
+    noiseBurst(en, 'snare', t, {
+      hp: 700, bp: 2000, bpQ: 1.1,
+      peak: 0.36 * vel * k, dur: ghost ? 0.09 : 0.17,
+    });
+    // тело снейра: два тона, чтобы читался не только шипением
+    tone(en, 'snare', t, 'triangle', 185, 165, 0.15 * vel * k, ghost ? 0.07 : 0.1);
+    tone(en, 'snare', t, 'triangle', 330, 300, 0.09 * vel * k, ghost ? 0.06 : 0.09);
+  }
+
+  function clap(en, t, vel = 1) {
+    if (skipLayer(en, 'clap')) return;
+    // три быстрых хлопка + хвост
+    const offs = [0, 0.011, 0.024];
+    for (const off of offs) {
+      noiseBurst(en, 'clap', t + off, {
+        hp: 700, bp: 1600, bpQ: 1.3, peak: 0.36 * vel, dur: 0.055,
+      });
+    }
+    noiseBurst(en, 'clap', t + 0.036, {
+      hp: 900, bp: 2100, bpQ: 0.8, peak: 0.22 * vel, dur: 0.17,
+    });
+  }
+
+  function hatClosed(en, t, vel = 1) {
+    if (skipLayer(en, 'hatClosed')) return;
+    noiseBurst(en, 'hatClosed', t, {
+      hp: 6200, pk: 8600, pkQ: 1.1, pkGain: 9,
+      peak: 0.2 * vel, dur: 0.045, attack: 0.0015,
+    });
+  }
+
+  function hatOpen(en, t, vel = 1) {
+    if (skipLayer(en, 'hatOpen')) return;
+    noiseBurst(en, 'hatOpen', t, {
+      hp: 5800, pk: 8200, pkQ: 0.9, pkGain: 7,
+      peak: 0.15 * vel, dur: 0.24, attack: 0.002,
+    });
+  }
+
+  function shaker(en, t, vel = 1) {
+    if (skipLayer(en, 'shaker')) return;
+    noiseBurst(en, 'shaker', t, {
+      hp: 3400, bp: 6000, bpQ: 0.8,
+      peak: 0.24 * vel, dur: 0.06, attack: 0.006,
+    });
+  }
+
+  function rim(en, t, vel = 1) {
+    if (skipLayer(en, 'rim')) return;
+    // деревянный римшот: короткий тон + щелчок
+    tone(en, 'rim', t, 'square', 1700, 1500, 0.1 * vel, 0.03, 0.001);
+    tone(en, 'rim', t, 'square', 2460, 2200, 0.08 * vel, 0.025, 0.001);
+    noiseBurst(en, 'rim', t, { hp: 1500, bp: 2600, bpQ: 1.4, peak: 0.11 * vel, dur: 0.025 });
+  }
+
+  function tom(en, t, low = 0, vel = 1) {
+    if (skipLayer(en, 'tom')) return;
+    const f0 = low ? 180 : 255;
+    const f1 = low ? 108 : 155;
+    tone(en, 'tom', t, 'sine', f0, f1, 0.34 * vel, low ? 0.26 : 0.2, 0.003);
+    noiseBurst(en, 'tom', t, { hp: 1200, bp: 1800, peak: 0.09 * vel, dur: 0.03 });
+  }
+
+  function bass(en, t, freq, dur = 0.14, vel = 1) {
+    if (skipLayer(en, 'bass')) return;
+    const c = en.ctx;
+    const dest = outOf(en, 'bass');
+    // пила с фильтром: гармоники 2f/3f слышны на телефоне, саб — на колонках
+    const saw = c.createOscillator();
+    saw.type = 'sawtooth';
+    saw.frequency.setValueAtTime(freq, t);
+    const lp = c.createBiquadFilter();
     lp.type = 'lowpass';
-    lp.Q.value = 7;
-    lp.frequency.setValueAtTime(520, t);
-    lp.frequency.exponentialRampToValueAtTime(240, t + dur);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(0.24 * vel, t + 0.012);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.03);
-    o.connect(lp);
-    lp.connect(g);
-    g.connect(music);
-    o.start(t);
-    o.stop(t + dur + 0.05);
-    o.onended = dispose([o, lp, g]);
-  }
-
-  function accent(t, vel = 1) {
-    // короткий шумовой краш
-    const n = ctx.createBufferSource();
-    n.buffer = noise;
-    const hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 3600;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(0.1 * vel, t + 0.005);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.42);
-    n.connect(hp);
-    hp.connect(g);
-    g.connect(music);
-    n.start(t);
-    n.stop(t + 0.44);
-    n.onended = dispose([n, hp, g]);
-
-    // низкий стаб на сильной доле
-    const o = ctx.createOscillator();
-    o.type = 'sawtooth';
-    o.frequency.setValueAtTime(110, t);
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.value = 760;
     lp.Q.value = 3;
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(0.0001, t);
-    og.gain.linearRampToValueAtTime(0.075 * vel, t + 0.01);
-    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
-    o.connect(lp);
-    lp.connect(og);
-    og.connect(music);
-    o.start(t);
-    o.stop(t + 0.32);
-    o.onended = dispose([o, lp, og]);
+    lp.frequency.setValueAtTime(1500, t);
+    lp.frequency.exponentialRampToValueAtTime(700, t + dur);
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.17 * vel, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.03);
+    saw.connect(lp);
+    lp.connect(g);
+    g.connect(dest);
+    saw.start(t);
+    saw.stop(t + dur + 0.05);
+    saw.onended = dispose([saw, lp, g]);
+
+    // октава сверху: тело баса в 160–250 Гц
+    const tri = c.createOscillator();
+    tri.type = 'triangle';
+    tri.frequency.setValueAtTime(freq * 2, t);
+    const tg = c.createGain();
+    tg.gain.setValueAtTime(0.0001, t);
+    tg.gain.linearRampToValueAtTime(0.075 * vel, t + 0.01);
+    tg.gain.exponentialRampToValueAtTime(0.0001, t + Math.min(dur, 0.18) + 0.03);
+    tri.connect(tg);
+    tg.connect(dest);
+    tri.start(t);
+    tri.stop(t + 0.23);
+    tri.onended = dispose([tri, tg]);
+
+    tone(en, 'bass', t, 'sine', freq, freq, 0.1 * vel, Math.min(dur, 0.22), 0.008);
+  }
+
+  function stab(en, t, vel = 1) {
+    if (skipLayer(en, 'stab')) return;
+    const c = en.ctx;
+    const dest = outOf(en, 'stab');
+    const lp = c.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 2200;
+    lp.Q.value = 1.2;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.15 * vel, t + 0.014);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.34);
+    const oscs = [];
+    for (const f of [220, 261.63, 329.63]) {
+      for (const det of [-7, 7]) {
+        const o = c.createOscillator();
+        o.type = 'sawtooth';
+        o.frequency.value = f;
+        o.detune.value = det;
+        o.connect(lp);
+        oscs.push(o);
+      }
+    }
+    lp.connect(g);
+    g.connect(dest);
+    for (const o of oscs) {
+      o.start(t);
+      o.stop(t + 0.36);
+    }
+    oscs[0].onended = dispose([...oscs, lp, g]);
+  }
+
+  function hookNote(en, t, freq, dur = 0.16, vel = 1) {
+    if (skipLayer(en, 'hook')) return;
+    tone(en, 'hook', t, 'triangle', freq, freq, 0.15 * vel, dur + 0.05, 0.004);
+    tone(en, 'hook', t, 'square', freq, freq, 0.038 * vel, dur, 0.003);
+  }
+
+  function crash(en, t, vel = 1) {
+    if (skipLayer(en, 'crash')) return;
+    noiseBurst(en, 'crash', t, {
+      hp: 3200, pk: 7600, pkQ: 0.7, pkGain: 6,
+      peak: 0.22 * vel, dur: 0.55, attack: 0.004,
+    });
   }
 
   /* ---------- секвенсор ---------- */
@@ -2090,48 +2240,123 @@ const audio = (() => {
     return STEP_BASE * (i % 2 === 0 ? SWING_EVEN : SWING_ODD);
   }
 
-  function scheduleStep(i, t) {
-    const seg = clamp(S.seg, 0, 2);
-    const s = i % 16;
-    const bar = Math.floor(i / 16);
-    const bar8 = bar % 8;
-    const fill = bar8 === 7;
-    const h = hash(i);
+  function barPattern(bar) {
+    return Math.floor(bar / 4) % 2 === 0 ? 'A' : 'B';
+  }
 
+  function hasStab(bar, seg) {
+    return seg === 2 && (bar % 8 === 4 || bar % 8 === 6);
+  }
+
+  // какие слои звучат в этом такте — для dbg и честного списка инструментов
+  function layersFor(bar, seg) {
+    const set = ['kick', 'snare', 'hatClosed', 'pad'];
+    const odd = bar % 2 === 1;
+    const bip = bar % 4;
+    if (bar % 2 === 0) set.push('hook');
     if (seg === 0) {
-      // первый отрезок: бит без баса, редкие восьмые хэты
-      if (s === 0 || s === 8) kick(t, 1);
-      else if (s === 7 || s === 14) kick(t, 0.72);
-      if (s === 4 || s === 12) snare(t, 0.92);
-      if (s % 2 === 0) hat(t, s % 4 === 0 ? 0.9 : 0.55);
-      if (s === 15 && h > 0.6) snare(t, 0.4, true);
-      return;
+      if (odd) set.push('hatOpen');
+      return set;
     }
-
-    if (s === 0 || s === 8) kick(t, 1);
-    else if (s === 3 || s === 7 || s === 11) kick(t, 0.78);
-    else if (s === 14) kick(t, 0.62);
-    else if (s === 13 && h > 0.62) kick(t, 0.5);
-
-    if (s === 4 || s === 12) snare(t, 1);
-    else if (!fill && (s === 7 || s === 15) && h > 0.55) snare(t, 0.42, true);
-    if (fill && s >= 12) snare(t, 0.35 + (s - 12) * 0.2);
-
-    // полные шестнадцатые с акцентами на восьмых
-    hat(t, s % 4 === 0 ? 1 : (s % 2 === 0 ? 0.68 : 0.42), s === 14 && bar8 % 2 === 0);
-    if (seg === 2 && s % 2 === 1 && h > 0.7) hat(t + STEP_BASE * 0.5, 0.3);
-
-    const root = [55, 55, 65.41, 49][bar % 4];
-    if (s === 0) bass(t, root, 0.24, 1);
-    else if (s === 8) bass(t, root, 0.2, 0.95);
-    else if (s === 3 || s === 11) bass(t, root * 2, 0.12, 0.72);
-    else if (s === 6) bass(t, root * 1.5, 0.14, 0.8);
-    else if (s === 14 && !fill) bass(t, root * 1.5, 0.12, 0.65);
-
+    set.push('hatOpen', 'bass');
+    if (!odd) set.push('clap', 'shaker');
+    else if (seg === 2) set.push('shaker');
+    if ((!odd && (bip === 0 || bip === 2)) || (seg === 2 && bip === 3 && bar % 8 !== 7)) set.push('rim');
     if (seg === 2) {
-      if (bar % 4 === 0 && s === 0) accent(t, 1);
-      if (bar % 8 === 4 && s === 8) accent(t, 0.6);
+      if (bar % 8 === 0 || bar % 8 === 7) set.push('crash');
+      if (bar % 8 === 7) set.push('tom');
+      if (hasStab(bar, seg)) set.push('stab');
     }
+    return set;
+  }
+
+  function scheduleStep(en, i, t) {
+    const seg = en.seg == null ? clamp(S.seg, 0, 2) : en.seg;
+    const s = i % BAR_STEPS;
+    const bar = Math.floor(i / BAR_STEPS);
+    const bip = bar % 4;
+    const pat = barPattern(bar);
+    const fill = bar % 8 === 7;
+    const odd = bar % 2 === 1;
+    const h = hash(i * 1.73 + bar * 0.37);
+
+    // ---- бочка: тело 180–250 Гц + панч, без опоры на саб
+    if (seg === 0) {
+      if (s === 0 || s === 8) kick(en, t, 1);
+      else if (s === 11 && odd) kick(en, t, 0.7);
+    } else {
+      const kicks = pat === 'A'
+        ? (odd ? KICK_A_SPARSE : KICK_A)
+        : (odd ? KICK_B_SPARSE : KICK_B);
+      if (kicks.includes(s)) {
+        const kv = (s === 0 || s === 8) ? 1 : 0.72;
+        kick(en, t, kv * (odd ? 0.85 : 1));
+      }
+      if (pat === 'B' && bip === 2 && s === 6) kick(en, t, 0.55);
+      if (fill && s === 15) kick(en, t, 0.62);
+    }
+
+    // ---- снейр с телом и призрачными нотами
+    if (s === 4 || s === 12) snare(en, t, 1);
+    else if (!fill && (s === 7 || s === 15) && h > 0.5) snare(en, t, 0.34, true);
+    else if (!fill && pat === 'B' && s === 14 && h > 0.35) snare(en, t, 0.3, true);
+    else if (!fill && odd && s === 14 && h > 0.55) snare(en, t, 0.28, true);
+    if (fill && s >= 12) snare(en, t, 0.28 + (s - 12) * 0.16);
+
+    // ---- клэп поверх снейра на 2 и 4: только в полных тактах
+    if (seg >= 1 && !odd && (s === 4 || s === 12)) clap(en, t, 0.95);
+    else if (seg >= 1 && pat === 'B' && bip === 1 && s === 15 && h > 0.45) clap(en, t, 0.4);
+
+    // ---- закрытые хэты: двор — восьмые, полные такты — шестнадцатые
+    if (seg === 0) {
+      if (s % 2 === 0) hatClosed(en, t, s % 4 === 0 ? 0.9 : 0.55);
+    } else if (!odd) {
+      if (s % 4 === 0) hatClosed(en, t, 1);
+      else if (s % 2 === 0) hatClosed(en, t, 0.7);
+      else hatClosed(en, t, 0.45);
+    } else if (s % 2 === 0) {
+      hatClosed(en, t, (s % 4 === 0 ? 1 : 0.62) * 0.7);
+    }
+    if (seg === 2 && odd && pat === 'B' && h > 0.3) hatClosed(en, t, 0.3);
+    const openStep = pat === 'A' ? (odd ? 6 : 14) : (odd ? 14 : 6);
+    if (s === openStep && (seg >= 1 || odd)) hatOpen(en, t, 0.9);
+
+    // ---- перкуссия: полные такты плотнее, разреженные дышат
+    if (seg >= 1) {
+      if (!odd) shaker(en, t, s % 4 === 2 ? 0.75 : 0.5);
+      else if (seg === 2 && s % 4 === 3) shaker(en, t, 0.35);
+      const rimStep = pat === 'A' ? 2 : 10;
+      if (!odd && (bip === 0 || bip === 2) && s === rimStep) rim(en, t, 0.8);
+      if (seg === 2 && bip === 3 && s === 5 && !fill) rim(en, t, 0.55);
+    }
+    if (seg >= 1 && fill && s >= 12) tom(en, t, s % 2 === 0 ? 0 : 1, 0.85);
+    else if (seg === 2 && bip === 2 && !fill && (s === 14 || s === 15) && h > 0.45) {
+      tom(en, t, s === 14 ? 0 : 1, 0.45);
+    }
+
+    // ---- бас: 2–3 ноты на такт, ход по корню/квинте/октаве
+    if (seg >= 1) {
+      const root = BASS_ROOTS[bar % 4];
+      const notes = (pat === 'A' ? BASS_A : BASS_B)[bip];
+      for (const n of notes) {
+        if (n[0] === s) bass(en, t, root * n[1], n[2], n[3]);
+      }
+    }
+
+    // ---- хук: короткая фраза раз в 2 такта
+    if (bar % 2 === 0) {
+      const hook = pat === 'A' ? HOOK_A : HOOK_B;
+      for (const n of hook) {
+        if (n[0] === s) hookNote(en, t, n[1], n[2], n[3]);
+      }
+    }
+
+    // ---- редкие аккордовые стабы и краши в городе
+    if (hasStab(bar, seg) && ((bar % 8 === 4 && s === 8) || (bar % 8 === 6 && s === 10))) {
+      stab(en, t, 0.9);
+    }
+    if (seg === 2 && bar % 8 === 0 && s === 0) crash(en, t, 1);
+    if (seg === 2 && bar % 8 === 7 && s === 8) crash(en, t, 0.5);
   }
 
   function schedule() {
@@ -2141,7 +2366,7 @@ const audio = (() => {
     while (nextAt < horizon && guard < 40) {
       // после фонового таба не выстреливаем пачкой в прошлое
       if (nextAt < ctx.currentTime - 0.08) nextAt = ctx.currentTime + 0.01;
-      scheduleStep(step, nextAt);
+      scheduleStep(LIVE, step, nextAt);
       nextAt += stepLen(step);
       step++;
       guard++;
@@ -2301,6 +2526,151 @@ const audio = (() => {
     return true;
   }
 
+  /* ---------- салют ---------- */
+
+  const FIREWORK_BOOMS = [0.55, 1.9, 3.25];   // залпы относительно запуска
+
+  function duckMusicFor(launchT) {
+    if (!ctx || !music) return;
+    const g = music.gain;
+    const duck = MUSIC_LEVEL * Math.pow(10, DUCK_DB / 20);
+    const now = ctx.currentTime;
+    g.cancelScheduledValues(Math.max(now, launchT - 0.02));
+    for (const b of FIREWORK_BOOMS) {
+      const t = launchT + b;
+      // 3.5 дБ вниз на залп, возврат за ~0.7 с
+      g.setTargetAtTime(duck, t, 0.05);
+      g.setTargetAtTime(MUSIC_LEVEL, t + 0.62, 0.1);
+    }
+    duckDb = DUCK_DB;
+    const until = launchT + FIREWORK_BOOMS[FIREWORK_BOOMS.length - 1] + 1.05;
+    duckUntil = performance.now() + Math.max(0, until - now) * 1000;
+  }
+
+  function fireworkRocket(en, t, level) {
+    const c = en.ctx;
+    const o = c.createOscillator();
+    o.type = 'triangle';
+    o.frequency.setValueAtTime(420, t);
+    o.frequency.exponentialRampToValueAtTime(1750, t + 0.5);
+    const bp = c.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 1200;
+    bp.Q.value = 1.4;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.055 * level, t + 0.08);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+    o.connect(bp);
+    bp.connect(g);
+    g.connect(en.sfx);
+    o.start(t);
+    o.stop(t + 0.57);
+    o.onended = dispose([o, bp, g]);
+
+    noiseBurst(en, null, t, {
+      dest: en.sfx, hp: 900, bp: 1800, bpQ: 0.9,
+      peak: 0.028 * level, dur: 0.5, attack: 0.05,
+    });
+  }
+
+  function fireworkBoom(en, t, level) {
+    const c = en.ctx;
+    const dest = en.sfx;
+    // низкий «бум»: пила даёт гармоники, которые слышит телефонный динамик
+    const saw = c.createOscillator();
+    saw.type = 'sawtooth';
+    saw.frequency.setValueAtTime(95, t);
+    saw.frequency.exponentialRampToValueAtTime(42, t + 0.5);
+    const lp = c.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = 700;
+    lp.Q.value = 1.2;
+    const g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.4 * level, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.6);
+    saw.connect(lp);
+    lp.connect(g);
+    g.connect(dest);
+    saw.start(t);
+    saw.stop(t + 0.62);
+    saw.onended = dispose([saw, lp, g]);
+
+    // тело бума в 150–300 Гц: то, что слышно на динамике телефона
+    const body = c.createOscillator();
+    body.type = 'triangle';
+    body.frequency.setValueAtTime(260, t);
+    body.frequency.exponentialRampToValueAtTime(110, t + 0.4);
+    const bg = c.createGain();
+    bg.gain.setValueAtTime(0.0001, t);
+    bg.gain.linearRampToValueAtTime(0.2 * level, t + 0.006);
+    bg.gain.exponentialRampToValueAtTime(0.0001, t + 0.45);
+    body.connect(bg);
+    bg.connect(dest);
+    body.start(t);
+    body.stop(t + 0.47);
+    body.onended = dispose([body, bg]);
+
+    // саб-синус тоже в sfx, а не в музыкальную шину
+    const sub = c.createOscillator();
+    sub.type = 'sine';
+    sub.frequency.setValueAtTime(72, t);
+    sub.frequency.exponentialRampToValueAtTime(38, t + 0.4);
+    const sg = c.createGain();
+    sg.gain.setValueAtTime(0.0001, t);
+    sg.gain.linearRampToValueAtTime(0.26 * level, t + 0.008);
+    sg.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+    sub.connect(sg);
+    sg.connect(dest);
+    sub.start(t);
+    sub.stop(t + 0.57);
+    sub.onended = dispose([sub, sg]);
+    // воздушный хлопок
+    noiseBurst(en, null, t, {
+      dest, hp: 220, bp: 900, bpQ: 0.6,
+      peak: 0.28 * level, dur: 0.32, attack: 0.004,
+    });
+  }
+
+  function fireworkCrackle(en, t, level, seed) {
+    const grains = 12;
+    for (let k = 0; k < grains; k++) {
+      const h1 = hash(seed + k * 1.7);
+      const h2 = hash(seed * 3.1 + k * 2.3);
+      const at = t + 0.06 + (k / grains) * 1.0 + h1 * 0.05;
+      noiseBurst(en, null, at, {
+        dest: en.sfx,
+        hp: 2400,
+        bp: 4200 + h2 * 2600,
+        bpQ: 1.6,
+        peak: (0.045 + 0.07 * h1) * level,
+        dur: 0.018 + 0.03 * h2,
+        attack: 0.001,
+      });
+    }
+  }
+
+  function fireworksAt(en, launchT, level) {
+    for (let i = 0; i < FIREWORK_BOOMS.length; i++) {
+      const bt = launchT + FIREWORK_BOOMS[i];
+      fireworkRocket(en, bt - 0.55, level);
+      fireworkBoom(en, bt, level);
+      fireworkCrackle(en, bt + 0.06, level, i * 13 + 5);
+    }
+    return FIREWORK_BOOMS[FIREWORK_BOOMS.length - 1] + 1.35;
+  }
+
+  function fireworks(level = 1) {
+    lastEvent = 'firework';
+    if (!ensure() || !ctx || ctx.state !== 'running') return false;
+    // залпы поверх музыки, но в шине sfx: бит не глушится
+    const launchT = ctx.currentTime + 0.2;
+    lastFireworkDur = Math.round(fireworksAt(LIVE, launchT, level) * 100) / 100;
+    duckMusicFor(launchT);
+    return true;
+  }
+
   /* ---------- замер и отладка ---------- */
 
   function rms() {
@@ -2341,6 +2711,219 @@ const audio = (() => {
       if (v > max) max = v;
     }
     return max;
+  }
+
+  /* ---------- офлайн-замер: соло слоёв, такты, полосы, пик ---------- */
+
+  function monoMix(buffer) {
+    const n = buffer.length;
+    const out = new Float32Array(n);
+    const chs = buffer.numberOfChannels;
+    for (let ch = 0; ch < chs; ch++) {
+      const d = buffer.getChannelData(ch);
+      for (let i = 0; i < n; i++) out[i] += d[i] / chs;
+    }
+    return out;
+  }
+
+  function rmsRange(data, from, to) {
+    let sum = 0;
+    let n = 0;
+    for (let i = Math.max(0, from); i < Math.min(data.length, to); i++) {
+      sum += data[i] * data[i];
+      n++;
+    }
+    return n ? Math.sqrt(sum / n) : 0;
+  }
+
+  function fft(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len;
+      const wr = Math.cos(ang);
+      const wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1;
+        let ci = 0;
+        for (let k = 0; k < len / 2; k++) {
+          const ar = re[i + k];
+          const ai = im[i + k];
+          const br = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+          const bi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+          re[i + k] = ar + br;
+          im[i + k] = ai + bi;
+          re[i + k + len / 2] = ar - br;
+          im[i + k + len / 2] = ai - bi;
+          const ncr = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr;
+          cr = ncr;
+        }
+      }
+    }
+  }
+
+  function spectrumShare(data, sr) {
+    const N = 2048;
+    const half = N / 2;
+    const re = new Float64Array(N);
+    const im = new Float64Array(N);
+    const pow = new Float64Array(half + 1);
+    const win = new Float64Array(N);
+    for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+    for (let start = 0; start + N <= data.length; start += N) {
+      for (let i = 0; i < N; i++) {
+        re[i] = data[start + i] * win[i];
+        im[i] = 0;
+      }
+      fft(re, im);
+      for (let k = 0; k <= half; k++) pow[k] += re[k] * re[k] + im[k] * im[k];
+    }
+    let low = 0, mid = 0, high = 0, total = 0;
+    for (let k = 1; k <= half; k++) {
+      const f = k * sr / N;
+      if (f < 20 || f > 20000) continue;
+      const p = pow[k];
+      total += p;
+      if (f < 200) low += p;
+      else if (f <= 8000) mid += p;
+      else high += p;
+    }
+    return {
+      share200_8k: +(mid / total).toFixed(4),
+      shareLow: +(low / total).toFixed(4),
+      shareHigh: +(high / total).toFixed(4),
+    };
+  }
+
+  async function renderPiece(opts) {
+    const OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OC) throw new Error('OfflineAudioContext недоступен');
+    const sr = opts.sampleRate || 44100;
+    const bars = Math.max(1, Math.min(32, opts.bars || 8));
+    const seg = opts.seg == null ? clamp(S.seg, 0, 2) : opts.seg;
+    const barDur = BAR_STEPS * STEP_BASE;
+    const dur = bars * barDur + 1.9;
+    const oc = new OC(1, Math.ceil(dur * sr), sr);
+    const fullGraph = opts.fullGraph !== false;
+    const musicGain = oc.createGain();
+    musicGain.gain.value = opts.musicMuted ? 0 : MUSIC_LEVEL;
+    const sfxGain = oc.createGain();
+    sfxGain.gain.value = SFX_LEVEL;
+    if (fullGraph) {
+      const masterGain = oc.createGain();
+      masterGain.gain.value = MASTER_LEVEL;
+      const compNode = oc.createDynamicsCompressor();
+      compNode.threshold.value = -14;
+      compNode.knee.value = 8;
+      compNode.ratio.value = 5;
+      compNode.attack.value = 0.004;
+      compNode.release.value = 0.18;
+      musicGain.connect(masterGain);
+      sfxGain.connect(masterGain);
+      masterGain.connect(compNode);
+      compNode.connect(oc.destination);
+    } else {
+      musicGain.connect(oc.destination);
+      sfxGain.connect(oc.destination);
+    }
+    const en = {
+      ctx: oc,
+      music: musicGain,
+      sfx: sfxGain,
+      buses: buildBuses(oc, musicGain, opts.solo || null),
+      noise: makeNoise(oc),
+      seg,
+      solo: opts.solo || null,
+    };
+    if (!opts.solo || opts.solo === 'pad') buildPad(en);
+    if (opts.fireworks) fireworksAt(en, 0.2, 1);
+
+    let at = 0.05;
+    for (let i = 0; i < bars * BAR_STEPS; i++) {
+      scheduleStep(en, i, at);
+      at += stepLen(i);
+    }
+
+    const rendered = await oc.startRendering();
+    const mono = monoMix(rendered);
+    let peak = 0;
+    for (let i = 0; i < mono.length; i++) {
+      const v = Math.abs(mono[i]);
+      if (v > peak) peak = v;
+    }
+    if (opts.solo) {
+      return { bars, seg, peak: +peak.toFixed(4), rms: +rmsRange(mono, 0, mono.length).toFixed(5) };
+    }
+    const barRms = [];
+    for (let b = 0; b < bars; b++) {
+      const from = Math.round((0.05 + b * barDur) * sr);
+      const to = Math.round((0.05 + (b + 1) * barDur) * sr);
+      barRms.push(+rmsRange(mono, from, to).toFixed(5));
+    }
+    const diffs = [];
+    for (let b = 1; b < barRms.length; b++) {
+      const a = barRms[b - 1];
+      const c = barRms[b];
+      diffs.push(+((Math.abs(a - c) / Math.max(a, c, 1e-9)) * 100).toFixed(1));
+    }
+    let fireworkDur = 0;
+    if (opts.fireworks) {
+      let last = 0;
+      for (let i = 0; i < mono.length; i++) if (Math.abs(mono[i]) > 0.0015) last = i;
+      fireworkDur = +(last / sr - 0.2).toFixed(2);
+    }
+    return {
+      bars,
+      seg,
+      peak: +peak.toFixed(4),
+      rms: +rmsRange(mono, 0, mono.length).toFixed(5),
+      barRms,
+      diffs,
+      pairsOver15: diffs.filter((d) => d >= 15).length,
+      spectrum: spectrumShare(mono, sr),
+      fireworkDur,
+      samples: mono.length,
+    };
+  }
+
+  // Полный замер: микс, вариативность тактов, полосы и соло каждого слоя.
+  async function offline(opts = {}) {
+    const bars = Math.max(1, Math.min(32, opts.bars || 8));
+    const seg = opts.seg == null ? clamp(S.seg, 0, 2) : opts.seg;
+    const mix = await renderPiece({ bars, seg, fullGraph: true });
+    const union = new Set();
+    for (let b = 0; b < bars; b++) for (const name of layersFor(b, seg)) union.add(name);
+    const out = { ...mix, instruments: LAYERS.filter((n) => union.has(n)) };
+    if (opts.solos !== false) {
+      const soloRms = {};
+      const soloBars = bars;
+      for (const name of LAYERS) {
+        const one = await renderPiece({ bars: soloBars, seg, solo: name, fullGraph: false });
+        soloRms[name] = one.rms;
+      }
+      out.soloRms = soloRms;
+      out.audible = Object.keys(soloRms).filter((k) => soloRms[k] >= 0.0015);
+      out.audibleCount = out.audible.length;
+    }
+    if (opts.fireworks) {
+      const fw = await renderPiece({ bars: 1, seg, fireworks: true, musicMuted: true, fullGraph: true });
+      out.fireworks = {
+        duration: fw.fireworkDur,
+        peak: fw.peak,
+        rms: fw.rms,
+        spectrum: fw.spectrum,
+      };
+    }
+    return out;
   }
 
   /* ---------- подсказка о звуке ---------- */
@@ -2410,6 +2993,8 @@ const audio = (() => {
   }
 
   function dbg() {
+    const segNow = clamp(S.seg, 0, 2);
+    const barNow = Math.floor(step / BAR_STEPS);
     return {
       state: ctx ? ctx.state : 'idle',
       sampleRate: ctx ? ctx.sampleRate : 0,
@@ -2426,9 +3011,16 @@ const audio = (() => {
       master: (muted || !started) ? 0 : MASTER_LEVEL,
       music: MUSIC_LEVEL,
       sfx: SFX_LEVEL,
+      musicGain: music ? Math.round(music.gain.value * 1000) / 1000 : 0,
+      ducking: performance.now() < duckUntil,
+      duckDb: performance.now() < duckUntil ? duckDb : 0,
+      lastFireworkDur,
       muted,
       bpm: BPM,
       step,
+      bar: barNow,
+      barPattern: barPattern(barNow),
+      instruments: layersFor(barNow, segNow),
       lastEvent,
     };
   }
@@ -2446,7 +3038,8 @@ const audio = (() => {
   return {
     start, setMuted, toggleMute, isMuted: () => muted,
     rms, peak, dbg, tick, unlock, context: () => ctx,
-    sfx: { siren, woop, warning, granny },
+    offline, layers: LAYERS.slice(),
+    sfx: { siren, woop, warning, granny, fireworks },
   };
 })();
 
@@ -3351,6 +3944,8 @@ function win() {
   S.capTimer = 0;
   captionEl.classList.remove('on');
   S.invert = 0;
+  // салют в момент, когда полиция перекрывает въезд и открывается багажник
+  audio.sfx.fireworks();
   say('Двор. Ворота. Наконец-то.', 3);
 }
 
@@ -3588,7 +4183,11 @@ function cubeResetForRetry() {
 }
 
 document.getElementById('retry').addEventListener('click', retrySegment);
-document.getElementById('again').addEventListener('click', () => startRun(true));
+document.getElementById('again').addEventListener('click', () => {
+  startRun(true);
+  // «ещё раз» — снова салют поверх нового заезда
+  audio.sfx.fireworks();
+});
 startEl.addEventListener('pointerdown', (e) => {
   if (S.phase === 'start') {
     e.preventDefault();
@@ -3673,6 +4272,9 @@ window.__game = {
     siren: (dur) => audio.sfx.siren(dur),
     woop: () => audio.sfx.woop(),
     granny: () => audio.sfx.granny(),
+    fireworks: (level) => audio.sfx.fireworks(level),
+    offline: (opts) => audio.offline(opts),
+    layers: () => audio.layers.slice(),
   },
   hit: (kind) => { S.invuln = 0; hit(kind); },
   get phase() { return S.phase; },
